@@ -8,6 +8,7 @@ import httpx
 
 from agent_reach.config import Settings
 from agent_reach.ingestion.base import BaseIngester, IngestionError
+from agent_reach.ingestion.papers import AIPapersOfTheWeekIngester
 from agent_reach.ingestion.search import (
     ArxivIngester,
     GoogleNewsIngester,
@@ -25,6 +26,7 @@ INGESTER_REGISTRY: dict[str, type[BaseIngester]] = {
     "google_news": GoogleNewsIngester,
     "wikipedia": WikipediaPageviewsIngester,
     "arxiv": ArxivIngester,
+    "ai_papers": AIPapersOfTheWeekIngester,
     "hackernews": HackerNewsIngester,
     "github": GitHubTrendingIngester,
     "producthunt": ProductHuntIngester,

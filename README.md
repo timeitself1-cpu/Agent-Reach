@@ -31,6 +31,7 @@ python -m agent_reach --json-out reports/latest.json --log-level DEBUG
 | `ingestion/base.py` | `BaseIngester`: shared `httpx.AsyncClient`, per-call timeout, exponential backoff + jitter, `Retry-After`, extra retryable statuses, per-ingester request pacing; `run()` never raises |
 | `ingestion/social.py` | X (Trends24 scrape), Reddit (JSON with score/comments -> RSS; 5 s timeout, 403/429 retries, 2 s pacing, 30 s budget), TikTok Creative Center (5 s timeout, retries, 2 s pacing) |
 | `ingestion/search.py` | Google Trends RSS, Google News RSS, Wikipedia top pageviews, ArXiv Atom API |
+| `ingestion/papers.py` | DAIR.AI "AI Papers of the Week" (newest week from `years/<year>.md` on GitHub) |
 | `ingestion/tech.py` | Hacker News (Algolia), GitHub Trending scrape, Product Hunt feed |
 | `pipeline/cleaner.py` | ASCII normalisation, hashtag splitting, engagement thresholds, noise regexes, de-dup, heuristic score, output sanitisers |
 | `pipeline/enricher.py` | Stage 2b: fetches each candidate's page (or Wikipedia summary API) and keeps title + meta description + 1-2 lead paragraphs (trafilatura, BeautifulSoup fallback) |
@@ -42,11 +43,11 @@ python -m agent_reach --json-out reports/latest.json --log-level DEBUG
 
 ## Pipeline stages
 
-1. **Ingest.** Ten sources are fetched concurrently. A failing source returns no items; it never fails the run.
+1. **Ingest.** Eleven sources are fetched concurrently. A failing source returns no items; it never fails the run.
 2. **Clean and select.** Engagement thresholds, noise regexes and de-duplication run first. Then the top `MAX_ITEMS_FOR_LLM` items, with a floor per source, become clustering candidates.
 3. **Enrich (2b).** Each candidate gets `context`: page title, meta description and 1-2 lead paragraphs.
    - Wikipedia uses its summary API.
-   - arXiv and Product Hunt use their feed text.
+   - arXiv, AI Papers of the Week and Product Hunt use their feed text.
    - X and TikTok have no article page, so their items get no context.
 4. **Cluster (3a-3e).**
    - **3a density:** embed `title + context`, run HDBSCAN (`min_cluster_size=2`, leaf selection), then apply a cosine-to-centroid gate. Outliers are noise and are dropped. They are never forced into a mixed bucket.
