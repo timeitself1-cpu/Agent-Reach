@@ -1,8 +1,9 @@
 name: cloud-runner
 
 # Cloud takeover for Agent Reach: runs the full pipeline on a GitHub-hosted runner
-# (Ollama + llama3.1:8b on CPU) and carries the SQLite velocity history between runs
-# through the Actions cache.
+# (Ollama on CPU, llama3.2:3b by default) and carries the SQLite velocity history between
+# runs through the Actions cache. Standard runners have no GPU: llama3.1:8b generates at
+# ~5 tok/s there, llama3.2:3b is roughly 2-3x faster.
 
 on:
   workflow_dispatch:
@@ -24,6 +25,14 @@ on:
         type: boolean
         required: false
         default: false
+      model:
+        description: "Ollama labelling model (3b is ~2-3x faster on the CPU runner)"
+        type: choice
+        required: false
+        default: "llama3.2:3b"
+        options:
+          - "llama3.2:3b"
+          - "llama3.1:8b"
   repository_dispatch:
     types: [cloud-handoff]
 
@@ -35,7 +44,8 @@ permissions:
   contents: read
 
 env:
-  MODEL: llama3.1:8b
+  MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'llama3.2:3b' }}
+  AGENT_REACH_OLLAMA_MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'llama3.2:3b' }}
   EMBED_MODEL: nomic-embed-text
   SESSION_STATE_ID: ${{ github.event.inputs.session_state_id || github.event.client_payload.session_state_id || 'dispatch' }}
   ENTRYPOINT: ${{ github.event.inputs.entrypoint || github.event.client_payload.entrypoint || 'agent_reach' }}
@@ -43,7 +53,7 @@ env:
   NO_LLM: ${{ github.event.inputs.no_llm || github.event.client_payload.no_llm || 'false' }}
   AGENT_REACH_DB_PATH: state/agent_reach.db
   AGENT_REACH_CONTACT_EMAIL: ${{ vars.AGENT_REACH_CONTACT_EMAIL || 'agent-reach@example.invalid' }}
-  # CPU-only runner: give the 8B model room per call and bound the LLM workload
+  # CPU-only runner: give the model room per call and bound the LLM workload
   AGENT_REACH_OLLAMA_TIMEOUT_S: "900"
   AGENT_REACH_MAX_ITEMS_FOR_LLM: "150"   # grouping is embedding-based; LLM only labels real clusters
   AGENT_REACH_LLM_MAX_RETRIES: "1"
@@ -62,6 +72,7 @@ jobs:
           echo "  entrypoint       : $ENTRYPOINT"
           echo "  extra_args       : $EXTRA_ARGS"
           echo "  no_llm           : $NO_LLM"
+          echo "  model            : $MODEL"
           echo "  commit           : $GITHUB_SHA"
 
       - uses: actions/checkout@v5
@@ -88,7 +99,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ~/.ollama/models
-          key: ollama-models-llama3.1-8b-nomic-embed-text
+          key: ollama-models-${{ env.MODEL }}-${{ env.EMBED_MODEL }}
 
       - name: Install and start Ollama
         if: env.NO_LLM != 'true'
@@ -111,7 +122,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/.ollama/models
-          key: ollama-models-llama3.1-8b-nomic-embed-text
+          key: ollama-models-${{ env.MODEL }}-${{ env.EMBED_MODEL }}
 
       - name: Run Agent Reach
         run: |
@@ -134,6 +145,7 @@ jobs:
             echo ""
             echo "- Session: \`$SESSION_STATE_ID\`"
             echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Model: \`$MODEL\` (no_llm: $NO_LLM)"
             echo ""
             echo '```text'
             if [ -f reports/report.txt ]; then cat reports/report.txt; else echo "no report produced"; fi
