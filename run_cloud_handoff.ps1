@@ -14,6 +14,7 @@
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\run_cloud_handoff.ps1
     .\run_cloud_handoff.ps1 -NoLLM -ExtraArgs "--top 10"
+    .\run_cloud_handoff.ps1 -Model llama3.1:8b   # slower, larger labelling model
     .\run_cloud_handoff.ps1 -NoWatch
     .\run_cloud_handoff.ps1 -Mirror          # also delete remote files that don't exist locally
 #>
@@ -26,11 +27,14 @@ param(
     [string]$SessionStateId = ("handoff-" + (Get-Date -Format "yyyyMMdd-HHmmss")),
     [string]$Entrypoint = "agent_reach",
     [string]$ExtraArgs = "",
+    [ValidateSet("llama3.2:3b", "llama3.1:8b")]
+    [string]$Model = "llama3.2:3b",   # cloud labelling model; the CPU runner generates ~2-3x faster with 3b
     [switch]$NoLLM,
     [switch]$Mirror,
     [switch]$NoWatch,
     [switch]$PushOnly,       # commit + push + verify, but do not dispatch a cloud run
-    [switch]$KeepWorkflow,   # don't overwrite .github/workflows/cloud-runner.yml with the embedded version
+    [switch]$KeepWorkflow,   # kept for compatibility: an existing cloud-runner.yml is never overwritten now
+    [switch]$ResetWorkflow,  # overwrite .github/workflows/cloud-runner.yml with the embedded version
     [int]$StartTimeoutSec = 180
 )
 
@@ -57,8 +61,9 @@ $CloudRunnerYaml = @'
 name: cloud-runner
 
 # Cloud takeover for Agent Reach: runs the full pipeline on a GitHub-hosted runner
-# (Ollama + llama3.1:8b on CPU) and carries the SQLite velocity history between runs
-# through the Actions cache.
+# (Ollama on CPU, llama3.2:3b by default) and carries the SQLite velocity history between
+# runs through the Actions cache. Standard runners have no GPU: llama3.1:8b generates at
+# ~5 tok/s there, llama3.2:3b is roughly 2-3x faster.
 
 on:
   workflow_dispatch:
@@ -80,6 +85,14 @@ on:
         type: boolean
         required: false
         default: false
+      model:
+        description: "Ollama labelling model (3b is ~2-3x faster on the CPU runner)"
+        type: choice
+        required: false
+        default: "llama3.2:3b"
+        options:
+          - "llama3.2:3b"
+          - "llama3.1:8b"
   repository_dispatch:
     types: [cloud-handoff]
 
@@ -91,7 +104,8 @@ permissions:
   contents: read
 
 env:
-  MODEL: llama3.1:8b
+  MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'llama3.2:3b' }}
+  AGENT_REACH_OLLAMA_MODEL: ${{ github.event.inputs.model || github.event.client_payload.model || 'llama3.2:3b' }}
   EMBED_MODEL: nomic-embed-text
   SESSION_STATE_ID: ${{ github.event.inputs.session_state_id || github.event.client_payload.session_state_id || 'dispatch' }}
   ENTRYPOINT: ${{ github.event.inputs.entrypoint || github.event.client_payload.entrypoint || 'agent_reach' }}
@@ -99,7 +113,7 @@ env:
   NO_LLM: ${{ github.event.inputs.no_llm || github.event.client_payload.no_llm || 'false' }}
   AGENT_REACH_DB_PATH: state/agent_reach.db
   AGENT_REACH_CONTACT_EMAIL: ${{ vars.AGENT_REACH_CONTACT_EMAIL || 'agent-reach@example.invalid' }}
-  # CPU-only runner: give the 8B model room per call and bound the LLM workload
+  # CPU-only runner: give the model room per call and bound the LLM workload
   AGENT_REACH_OLLAMA_TIMEOUT_S: "900"
   AGENT_REACH_MAX_ITEMS_FOR_LLM: "150"   # grouping is embedding-based; LLM only labels real clusters
   AGENT_REACH_LLM_MAX_RETRIES: "1"
@@ -118,11 +132,12 @@ jobs:
           echo "  entrypoint       : $ENTRYPOINT"
           echo "  extra_args       : $EXTRA_ARGS"
           echo "  no_llm           : $NO_LLM"
+          echo "  model            : $MODEL"
           echo "  commit           : $GITHUB_SHA"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -132,7 +147,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Restore velocity history (SQLite)
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: state
           key: agent-reach-db-${{ github.run_id }}
@@ -141,10 +156,10 @@ jobs:
       - name: Restore Ollama model cache
         if: env.NO_LLM != 'true'
         id: model-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.ollama/models
-          key: ollama-models-llama3.1-8b-nomic-embed-text
+          key: ollama-models-${{ env.MODEL }}-${{ env.EMBED_MODEL }}
 
       - name: Install and start Ollama
         if: env.NO_LLM != 'true'
@@ -164,10 +179,10 @@ jobs:
 
       - name: Save Ollama model cache
         if: env.NO_LLM != 'true' && steps.model-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.ollama/models
-          key: ollama-models-llama3.1-8b-nomic-embed-text
+          key: ollama-models-${{ env.MODEL }}-${{ env.EMBED_MODEL }}
 
       - name: Run Agent Reach
         run: |
@@ -190,6 +205,7 @@ jobs:
             echo ""
             echo "- Session: \`$SESSION_STATE_ID\`"
             echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Model: \`$MODEL\` (no_llm: $NO_LLM)"
             echo ""
             echo '```text'
             if [ -f reports/report.txt ]; then cat reports/report.txt; else echo "no report produced"; fi
@@ -198,14 +214,14 @@ jobs:
 
       - name: Save velocity history (SQLite)
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: state
           key: agent-reach-db-${{ github.run_id }}
 
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: agent-reach-report-${{ github.run_id }}
           path: |
@@ -330,9 +346,12 @@ if ($leaks) { Fail ("Possible secrets in staged files - fix before pushing:`n  "
 Ok ("Staged " + $staged.Count + " changed path(s); secret scan clean")
 $wfPath = Join-Path $root ".github/workflows/$Workflow"
 $wfExpected = $CloudRunnerYaml.Replace("`r`n", "`n") + "`n"
-if ($Workflow -eq "cloud-runner.yml" -and -not $KeepWorkflow) {
+if ($Workflow -eq "cloud-runner.yml") {
     $wfCurrent = if (Test-Path -LiteralPath $wfPath) { [System.IO.File]::ReadAllText($wfPath).Replace("`r`n", "`n") } else { $null }
-    if ($wfCurrent -ne $wfExpected) {
+    # the repo's workflow is the source of truth; the embedded copy only bootstraps a missing file
+    if ($wfCurrent -and $wfCurrent -ne $wfExpected -and -not $ResetWorkflow) {
+        Warn "Keeping existing .github/workflows/$Workflow (differs from the embedded copy; -ResetWorkflow overwrites it)"
+    } elseif ($wfCurrent -ne $wfExpected) {
         New-Item -ItemType Directory -Force -Path (Split-Path $wfPath -Parent) -ErrorAction Stop | Out-Null
         try {
             [System.IO.File]::WriteAllText($wfPath, $wfExpected, (New-Object System.Text.UTF8Encoding($false)))
@@ -385,14 +404,14 @@ $noLlmValue = if ($NoLLM) { "true" } else { "false" }
 
 $wfArgs = @("workflow", "run", $Workflow, "--repo", $ownerRepo, "--ref", $Branch,
             "-f", "session_state_id=$SessionStateId", "-f", "entrypoint=$Entrypoint",
-            "-f", "extra_args=$ExtraArgs", "-f", "no_llm=$noLlmValue")
+            "-f", "extra_args=$ExtraArgs", "-f", "no_llm=$noLlmValue", "-f", "model=$Model")
 $ok = $false
 for ($i = 1; $i -le 6 -and -not $ok; $i++) {   # a just-pushed workflow can take a few seconds to register
     $out = & gh @wfArgs 2>&1 | ForEach-Object { "$_" }
     if ($LASTEXITCODE -eq 0) { $ok = $true } else { Warn "Dispatch not accepted yet ($(($out | Out-String).Trim())); retry $i/6"; Start-Sleep -Seconds 5 }
 }
 if (-not $ok) { Fail "Could not dispatch $Workflow. Check that Actions is enabled: https://github.com/$ownerRepo/settings/actions" }
-Ok "Dispatched (session_state_id=$SessionStateId, entrypoint=$Entrypoint, no_llm=$noLlmValue)"
+Ok "Dispatched (session_state_id=$SessionStateId, entrypoint=$Entrypoint, no_llm=$noLlmValue, model=$Model)"
 
 # ------------------------------------------------------------------ 5. confirm running
 Step "Waiting for the run to start"

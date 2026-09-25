@@ -136,6 +136,13 @@ def test_pace_never_starts_requests_closer_than_interval():
     assert min(b - a for a, b in zip(starts, starts[1:])) >= 0.05
 
 
+def test_tiktok_is_opt_in():
+    from agent_reach.ingestion import INGESTER_REGISTRY
+
+    assert "tiktok" not in Settings().enabled_sources
+    assert "tiktok" in INGESTER_REGISTRY  # still available via --sources / AGENT_REACH_ENABLED_SOURCES
+
+
 def test_tiktok_paced_retries_then_clean_fail():
     stamps: list[float] = []
 
