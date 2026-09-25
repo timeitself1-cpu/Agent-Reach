@@ -59,6 +59,8 @@ log = logging.getLogger(__name__)
 #: llama3.1:8b starts dropping commas / truncating JSON above ~25 items per call.
 MAX_BATCH_SIZE = 25
 MIN_BATCH_SIZE = 5
+#: generation cap per label call; bounded schemas keep a valid answer far below it
+NUM_PREDICT = 2048
 HEADLINE_MAX_WORDS = 10
 
 CATEGORY_ALIASES: dict[str, CategoryEnum] = {
@@ -147,20 +149,31 @@ FILLER_RX = re.compile(
 
 
 # ======================================================================= schemas
-def _relabel_schema() -> dict[str, Any]:
+def _relabel_schema(n_groups: int, n_offered: int) -> dict[str, Any]:
+    """Output schema for one label call, bounded so constrained decoding cannot loop.
+
+    Unbounded arrays let llama3.1:8b repeat entities or assignments until ``num_predict``
+    runs out (2048 tokens of truncated JSON for a 5-group call in cloud-runner run 36127841328).
+    """
     return {
         "type": "object",
         "properties": {
             "groups": {
                 "type": "array",
+                "minItems": n_groups,
+                "maxItems": n_groups,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "group_id": {"type": "integer"},
-                        "headline": {"type": "string"},
+                        "group_id": {"type": "integer", "minimum": 1, "maximum": max(1, n_groups)},
+                        "headline": {"type": "string", "maxLength": 100},
                         "category": {"type": "string", "enum": CategoryEnum.values()},
-                        "primary_entities": {"type": "array", "items": {"type": "string"}},
-                        "summary": {"type": "string"},
+                        "primary_entities": {
+                            "type": "array",
+                            "maxItems": 5,
+                            "items": {"type": "string", "maxLength": 60},
+                        },
+                        "summary": {"type": "string", "maxLength": 400},
                         "relevance_score": {"type": "integer", "minimum": 1, "maximum": 10},
                     },
                     "required": ["group_id", "headline", "category", "primary_entities", "summary", "relevance_score"],
@@ -168,9 +181,13 @@ def _relabel_schema() -> dict[str, Any]:
             },
             "assignments": {
                 "type": "array",
+                "maxItems": n_offered,
                 "items": {
                     "type": "object",
-                    "properties": {"item_id": {"type": "integer"}, "group_id": {"type": "integer"}},
+                    "properties": {
+                        "item_id": {"type": "integer", "minimum": 1, "maximum": max(1, n_offered)},
+                        "group_id": {"type": "integer", "minimum": 0, "maximum": max(1, n_groups)},
+                    },
                     "required": ["item_id", "group_id"],
                 },
             },
@@ -517,12 +534,16 @@ class SemanticClusterer:
         * logs duration and generation speed (tokens/s) when the call returns
         * a timeout is NOT retried: re-sending the same prompt to an overloaded CPU would only
           burn another full timeout window; the caller falls back to heuristics instead
+        * neither is output cut off at ``num_predict``: at low temperature the same prompt
+          runs away the same way again
         """
         client = self._get_client()
         last_exc: Exception | None = None
         for attempt in range(self.settings.llm_max_retries + 1):
             started = time.perf_counter()
             heartbeat = asyncio.create_task(self._heartbeat(label, started))
+            content: str | None = None
+            resp: Any = None
             try:
                 resp = await client.chat(
                     model=self.settings.ollama_model,
@@ -531,7 +552,7 @@ class SemanticClusterer:
                     options={
                         "temperature": self.settings.ollama_temperature,
                         "num_ctx": self.settings.ollama_num_ctx,
-                        "num_predict": 2048,
+                        "num_predict": NUM_PREDICT,
                     },
                     keep_alive=self.settings.ollama_keep_alive,
                 )
@@ -543,7 +564,14 @@ class SemanticClusterer:
                 return extract_json(content or "")
             except json.JSONDecodeError as exc:
                 last_exc = exc
-                log.warning("%s: invalid JSON (attempt %d): %s", label, attempt + 1, exc)
+                tail = normalize_text((content or "")[-200:])
+                log.warning("%s: invalid JSON (attempt %d): %s | output ends: ...%s", label, attempt + 1, exc, tail)
+                gen = getattr(resp, "eval_count", None)
+                if gen is None and isinstance(resp, dict):
+                    gen = resp.get("eval_count")
+                if gen is not None and gen >= NUM_PREDICT:
+                    log.warning("%s: output hit the %d-token cap - not retrying (falls back to heuristics)", label, NUM_PREDICT)
+                    raise ClusteringError(f"{label} output truncated at {NUM_PREDICT} tokens") from exc
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 msg = str(exc).lower()
@@ -861,7 +889,9 @@ class SemanticClusterer:
                 ci, len(chunks), len(group_chunk), sum(len(d.item_ids) for d in group_chunk), shown_count(group_chunk), len(offered),
             )
             try:
-                data = await self._chat_json(CLUSTER_SYSTEM_PROMPT, "\n".join(lines), _relabel_schema(), f"label {ci}/{len(chunks)}")
+                data = await self._chat_json(
+                    CLUSTER_SYSTEM_PROMPT, "\n".join(lines), _relabel_schema(len(group_chunk), len(offered)), f"label {ci}/{len(chunks)}"
+                )
                 parsed = _RelabelResponse.model_validate(data)
             except (ClusteringError, ValueError) as exc:
                 log.warning("relabel pass failed (%s); using heuristic labels", exc)
