@@ -4,7 +4,7 @@ import json
 
 from agent_reach.config import Settings
 from agent_reach.models import CleanedTrendItem, SourceName
-from agent_reach.pipeline.clusterer import DraftCluster, SemanticClusterer, _excerpt
+from agent_reach.pipeline.clusterer import DraftCluster, LinkIndex, SemanticClusterer, _excerpt
 from agent_reach.pipeline.density import _cosine_gate
 
 
@@ -44,7 +44,8 @@ def test_prompt_shows_central_members_and_short_context():
     c = SemanticClusterer(Settings(llm_items_per_group=4, llm_context_chars=100))
     c._client = fake
 
-    asyncio.run(c._relabel([DraftCluster([it.item_id for it in items], "", "", needs_label=True)], [], by_id))
+    draft = DraftCluster([it.item_id for it in items], "", "", needs_label=True)
+    asyncio.run(c._relabel([draft], [], by_id, LinkIndex(items)))
 
     prompt = fake.prompts[0]
     member_lines = [ln for ln in prompt.splitlines() if ln.startswith("  - ")]
