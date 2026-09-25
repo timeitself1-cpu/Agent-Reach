@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     reddit_rss_max_rank: int = Field(default=10, ge=0, le=100)  # RSS "top of day" ranks kept without metrics
     reddit_timeout_s: float = 3.0  # per-endpoint timeout so blocked JSON fails fast to RSS
     reddit_concurrency: int = Field(default=3, ge=1, le=6)
+    reddit_rss_spacing_s: float = Field(default=2.0, ge=0.0, le=10.0)  # gap between RSS calls once JSON is blocked
     hn_min_points: int = 10
     github_min_stars_today: int = 20
     min_title_chars: int = 3
@@ -87,6 +88,7 @@ class Settings(BaseSettings):
     min_cluster_items: int = Field(default=2, ge=1)
     singleton_keep_score: float = Field(default=0.80, ge=0.0, le=1.0)
     singleton_keep_relevance: int = Field(default=7, ge=1, le=10)
+    min_cluster_relevance: int = Field(default=4, ge=1, le=10)  # LLM relevance below this is dropped
 
     # -------------------------------------------------------------- scoring
     velocity_windows_hours: list[float] = Field(default_factory=lambda: [1.0, 6.0, 24.0])

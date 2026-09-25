@@ -17,13 +17,16 @@ produces the report instead, so the pipeline never hard-fails.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 from pydantic import BaseModel, Field, field_validator
 
 from agent_reach.config import Settings
@@ -368,12 +371,35 @@ class LinkIndex:
     when both literally name the same multi-character entity phrase.
     """
 
-    def __init__(self, items: list[CleanedTrendItem]) -> None:
-        self.text_keys = {it.item_id: dedupe_key(_item_text(it)) for it in items}
-        self.toks = {it.item_id: significant_tokens(_item_text(it)) for it in items}
+    def __init__(self, items: list[CleanedTrendItem], corpus: list[CleanedTrendItem] | None = None) -> None:
+        # ``corpus`` = every cleaned item of the run (not just the LLM batch): more evidence for co-occurrence
+        pool = {it.item_id: it for it in (corpus or [])}
+        pool.update({it.item_id: it for it in items})
+        self.text_keys = {iid: dedupe_key(_item_text(it)) for iid, it in pool.items()}
+        self.toks = {iid: significant_tokens(_item_text(it)) for iid, it in pool.items()}
         self.df: Counter[str] = Counter(t for ts in self.toks.values() for t in ts)
-        n = max(1, len(items))
+        n = max(1, len(pool))
         self.rare_cap = max(4, int(0.06 * n))
+        self._rx_cache: dict[str, re.Pattern[str] | None] = {}
+        self._co_cache: dict[tuple[str, str], bool] = {}
+
+    def _entity_rx(self, entity: str) -> re.Pattern[str] | None:
+        key = dedupe_key(entity)
+        if key not in self._rx_cache:
+            self._rx_cache[key] = re.compile(r"\b" + re.escape(key) + r"\b") if len(key) >= 4 else None
+        return self._rx_cache[key]
+
+    def cooccur(self, e1: str, e2: str) -> bool:
+        """True when some item of the run names both entities (e.g. a headline 'Packers vs. Falcons ...')."""
+        k1, k2 = sorted((dedupe_key(e1), dedupe_key(e2)))
+        if k1 == k2:
+            return True
+        if (k1, k2) not in self._co_cache:
+            r1, r2 = self._entity_rx(e1), self._entity_rx(e2)
+            self._co_cache[(k1, k2)] = bool(r1 and r2) and any(
+                r1.search(t) and r2.search(t) for t in self.text_keys.values()
+            )
+        return self._co_cache[(k1, k2)]
 
     def linked(self, a: int, b: int) -> bool:
         ta, tb = self.toks.get(a, set()), self.toks.get(b, set())
@@ -390,10 +416,8 @@ class LinkIndex:
         return False
 
     def mentions(self, item_id: int, entity: str) -> bool:
-        key = dedupe_key(entity)
-        if len(key) < 4:
-            return False
-        return re.search(r"\b" + re.escape(key) + r"\b", self.text_keys.get(item_id, "")) is not None
+        rx = self._entity_rx(entity)
+        return rx is not None and rx.search(self.text_keys.get(item_id, "")) is not None
 
     def components(self, ids: list[int], entities: list[str]) -> list[list[int]]:
         parent = {i: i for i in ids}
@@ -408,11 +432,21 @@ class LinkIndex:
             for y in range(x + 1, len(ids)):
                 if self.linked(ids[x], ids[y]):
                     parent[find(ids[y])] = find(ids[x])
-        # literal shared entity mention also links (phrase match only; no tail-token guessing)
-        for e in entities:
-            holders = [i for i in ids if self.mentions(i, e)]
-            for h in holders[1:]:
-                parent[find(h)] = find(holders[0])
+        # entity evidence (phrase match only; no tail-token guessing):
+        #  * two items naming the same entity are linked
+        #  * items naming DIFFERENT entities are linked only when those entities co-occur in some
+        #    other item of the run ('Packers' + 'Falcons' <- 'Packers vs. Falcons: ...'). An LLM
+        #    entity list alone is never enough evidence ('Samsung' + 'F-Droid' never co-occur).
+        holders = {e: [i for i in ids if self.mentions(i, e)] for e in entities}
+        holders = {e: h for e, h in holders.items() if h}
+        for h in holders.values():
+            for x in h[1:]:
+                parent[find(x)] = find(h[0])
+        ents = list(holders)
+        for a in range(len(ents)):
+            for b in range(a + 1, len(ents)):
+                if self.cooccur(ents[a], ents[b]):
+                    parent[find(holders[ents[b]][0])] = find(holders[ents[a]][0])
         comps: dict[int, list[int]] = defaultdict(list)
         for i in ids:
             comps[find(i)].append(i)
@@ -471,10 +505,21 @@ class SemanticClusterer:
             return True, "ok"
         return False, f"model '{wanted}' not pulled (run: ollama pull {wanted})"
 
-    async def _chat_json(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
+    async def _chat_json(
+        self, system: str, user: str, schema: dict[str, Any], label: str = "LLM call"
+    ) -> dict[str, Any]:
+        """One structured Ollama call with live progress logging.
+
+        * logs a heartbeat every 60 s so a slow CPU inference never looks like a hang
+        * logs duration and generation speed (tokens/s) when the call returns
+        * a timeout is NOT retried: re-sending the same prompt to an overloaded CPU would only
+          burn another full timeout window; the caller falls back to heuristics instead
+        """
         client = self._get_client()
         last_exc: Exception | None = None
         for attempt in range(self.settings.llm_max_retries + 1):
+            started = time.perf_counter()
+            heartbeat = asyncio.create_task(self._heartbeat(label, started))
             try:
                 resp = await client.chat(
                     model=self.settings.ollama_model,
@@ -487,6 +532,7 @@ class SemanticClusterer:
                     },
                     keep_alive=self.settings.ollama_keep_alive,
                 )
+                self._log_call_stats(label, resp, time.perf_counter() - started)
                 message = getattr(resp, "message", None)
                 content = getattr(message, "content", None) if message is not None else None
                 if content is None and isinstance(resp, dict):
@@ -494,7 +540,7 @@ class SemanticClusterer:
                 return extract_json(content or "")
             except json.JSONDecodeError as exc:
                 last_exc = exc
-                log.warning("LLM returned invalid JSON (attempt %d): %s", attempt + 1, exc)
+                log.warning("%s: invalid JSON (attempt %d): %s", label, attempt + 1, exc)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 msg = str(exc).lower()
@@ -502,12 +548,46 @@ class SemanticClusterer:
                     log.info("server rejected JSON-schema format; falling back to format='json'")
                     self._use_schema = False
                     continue
-                log.warning("Ollama call failed (attempt %d): %s: %s", attempt + 1, type(exc).__name__, exc)
-        raise ClusteringError(f"LLM call failed after retries: {last_exc}")
+                elapsed = time.perf_counter() - started
+                if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)) or "timed out" in msg:
+                    log.warning("%s: timed out after %.0f s - not retrying (falls back to heuristics)", label, elapsed)
+                    raise ClusteringError(f"{label} timed out after {elapsed:.0f}s") from exc
+                log.warning("%s failed (attempt %d): %s: %s", label, attempt + 1, type(exc).__name__, exc)
+            finally:
+                heartbeat.cancel()
+        raise ClusteringError(f"{label} failed after retries: {last_exc}")
+
+    @staticmethod
+    async def _heartbeat(label: str, started: float, every: float = 60.0) -> None:
+        try:
+            while True:
+                await asyncio.sleep(every)
+                log.info("%s: still generating (%.0f s elapsed)", label, time.perf_counter() - started)
+        except asyncio.CancelledError:
+            return
+
+    @staticmethod
+    def _log_call_stats(label: str, resp: Any, elapsed: float) -> None:
+        def field(name: str) -> Any:
+            v = getattr(resp, name, None)
+            if v is None and isinstance(resp, dict):
+                v = resp.get(name)
+            return v
+
+        prompt_tokens, gen_tokens, gen_ns = field("prompt_eval_count"), field("eval_count"), field("eval_duration")
+        if gen_tokens and gen_ns:
+            log.info(
+                "%s: done in %.0f s (%s prompt tokens, %s generated @ %.1f tok/s)",
+                label, elapsed, prompt_tokens or "?", gen_tokens, gen_tokens / (gen_ns / 1e9),
+            )
+        else:
+            log.info("%s: done in %.0f s", label, elapsed)
 
     # ....................................................... public entry point
-    async def cluster(self, items: list[CleanedTrendItem]) -> tuple[list[MacroCluster], int, str]:
-        """Returns (clusters, discarded_count, mode)."""
+    async def cluster(
+        self, items: list[CleanedTrendItem], corpus: list[CleanedTrendItem] | None = None
+    ) -> tuple[list[MacroCluster], int, str]:
+        """Returns (clusters, discarded_count, mode). ``corpus`` = all cleaned items (co-occurrence evidence)."""
         if not items:
             return [], 0, "empty"
         ok, reason = await self.health_check()
@@ -516,7 +596,7 @@ class SemanticClusterer:
             clusters, discarded = self.heuristic_cluster(items)
             return clusters, discarded, f"heuristic ({reason})"
         try:
-            clusters, discarded = await self._llm_cluster(items)
+            clusters, discarded = await self._llm_cluster(items, corpus)
             return clusters, discarded, f"ollama:{self.settings.ollama_model}"
         except ClusteringError as exc:
             log.error("LLM clustering failed (%s) -> heuristic fallback", exc)
@@ -524,9 +604,11 @@ class SemanticClusterer:
             return clusters, discarded, "heuristic (LLM error)"
 
     # ....................................................... LLM path
-    async def _llm_cluster(self, items: list[CleanedTrendItem]) -> tuple[list[MacroCluster], int]:
+    async def _llm_cluster(
+        self, items: list[CleanedTrendItem], corpus: list[CleanedTrendItem] | None = None
+    ) -> tuple[list[MacroCluster], int]:
         by_id = {it.item_id: it for it in items}
-        index = LinkIndex(items)
+        index = LinkIndex(items, corpus)
         batches = self._make_batches(items)
         drafts: list[DraftCluster] = []
         discarded: set[int] = set()
@@ -537,7 +619,7 @@ class SemanticClusterer:
             prompt = self._render_batch(batch)
             log.info("LLM batch %d/%d (%d items)", bi, len(batches), len(batch))
             try:
-                data = await self._chat_json(CLUSTER_SYSTEM_PROMPT, prompt, _cluster_schema())
+                data = await self._chat_json(CLUSTER_SYSTEM_PROMPT, prompt, _cluster_schema(), f"cluster batch {bi}/{len(batches)}")
                 parsed = LLMClusterResponse.model_validate(data)
             except (ClusteringError, ValueError) as exc:
                 failures += 1
@@ -661,22 +743,16 @@ class SemanticClusterer:
             strays = [c[0] for c in comps if len(c) == 1]
 
             if not cores:
-                # nothing links lexically; trust small entity-resolved groups where every item names an entity
-                if len(d.item_ids) <= 3 and all(any(index.mentions(i, e) for e in d.entities) for i in d.item_ids):
-                    out.append(d)
-                else:
-                    orphans.extend(d.item_ids)
-                    split_count += 1
+                # no two items share a topic by tokens or co-occurring entities: the grouping is unsupported
+                orphans.extend(d.item_ids)
+                split_count += 1
                 continue
 
             if len(cores) == 1:
+                # strays already had every chance to link (tokens, shared or co-occurring entities)
                 core = list(cores[0])
-                for s in strays:
-                    if any(index.mentions(s, e) for e in d.entities):
-                        core.append(s)
-                    else:
-                        orphans.append(s)
-                ejected = len(d.item_ids) - len(core)
+                orphans.extend(strays)
+                ejected = len(strays)
                 out.append(
                     DraftCluster(
                         item_ids=core,
@@ -692,22 +768,8 @@ class SemanticClusterer:
                 continue
 
             split_count += 1
-            new_parts = [DraftCluster(item_ids=list(c), headline="", category_raw="", needs_label=True) for c in cores]
-            for s in strays:
-                home = None
-                for part in new_parts:
-                    owned = [
-                        e for e in d.entities
-                        if index.mentions(s, e) and any(index.mentions(m, e) for m in part.item_ids)
-                    ]
-                    if owned:
-                        home = part
-                        break
-                if home is not None:
-                    home.item_ids.append(s)
-                else:
-                    orphans.append(s)
-            out.extend(new_parts)
+            out.extend(DraftCluster(item_ids=list(c), headline="", category_raw="", needs_label=True) for c in cores)
+            orphans.extend(strays)
         for d in out:
             grounded = self._ground_entities(d.entities, d.item_ids, index)
             # a label whose entities mostly don't appear in its own items, or an umbrella
@@ -798,7 +860,7 @@ class SemanticClusterer:
             lines.append(f"Label groups 1..{len(group_chunk)}" + (" and assign each unassigned signal." if offered else "."))
             log.info("LLM relabel %d/%d (%d groups, %d unassigned)", ci, len(chunks), len(group_chunk), len(offered))
             try:
-                data = await self._chat_json(RELABEL_PROMPT, "\n".join(lines), _relabel_schema())
+                data = await self._chat_json(RELABEL_PROMPT, "\n".join(lines), _relabel_schema(), f"relabel {ci}/{len(chunks)}")
                 parsed = _RelabelResponse.model_validate(data)
             except (ClusteringError, ValueError) as exc:
                 log.warning("relabel pass failed (%s); using heuristic labels", exc)
@@ -831,7 +893,7 @@ class SemanticClusterer:
             ents = ", ".join(d.entities[:5]) or "-"
             lines.append(f"{i} | {coerce_category(d.category_raw).value} | {normalize_text(d.headline)[:120]} | {ents}")
         try:
-            data = await self._chat_json(MERGE_PROMPT, "\n".join(lines), _merge_schema())
+            data = await self._chat_json(MERGE_PROMPT, "\n".join(lines), _merge_schema(), "merge pass")
             parsed = LLMMergeResponse.model_validate(data)
         except (ClusteringError, ValueError) as exc:
             log.warning("merge pass failed (%s); keeping batch clusters", exc)
@@ -993,6 +1055,9 @@ class SemanticClusterer:
         for d in drafts:
             members = [by_id[i] for i in dict.fromkeys(d.item_ids) if i in by_id]
             if not members:
+                continue
+            if d.relevance < s.min_cluster_relevance:
+                dropped += len(members)
                 continue
             best_score = max(m.heuristic_score for m in members)
             multi_source = len({m.source for m in members}) > 1 or any(m.duplicate_count > 1 for m in members)

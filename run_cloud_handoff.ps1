@@ -29,6 +29,7 @@ param(
     [switch]$NoLLM,
     [switch]$Mirror,
     [switch]$NoWatch,
+    [switch]$KeepWorkflow,   # don't overwrite .github/workflows/cloud-runner.yml with the embedded version
     [int]$StartTimeoutSec = 180
 )
 
@@ -99,7 +100,9 @@ env:
   # CPU-only runner: give the 8B model room per call and bound the LLM workload
   AGENT_REACH_OLLAMA_TIMEOUT_S: "900"
   AGENT_REACH_MAX_ITEMS_FOR_LLM: "80"
+  AGENT_REACH_LLM_MAX_RETRIES: "1"
   PYTHONIOENCODING: utf-8
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   run-pipeline:
@@ -171,7 +174,10 @@ jobs:
           # shellcheck disable=SC2206
           EXTRA=($EXTRA_ARGS)
           set -o pipefail
-          python -m "$ENTRYPOINT" "${ARGS[@]}" "${EXTRA[@]}" 2> reports/pipeline.log | tee reports/report.txt
+          # stderr (all progress logs) streams live to the job log AND is saved to pipeline.log;
+          # stdout (the final executive report) goes to the log and report.txt
+          python -u -m "$ENTRYPOINT" "${ARGS[@]}" "${EXTRA[@]}" \
+            2> >(tee reports/pipeline.log >&2) | tee reports/report.txt
 
       - name: Publish run summary
         if: always()
@@ -320,17 +326,23 @@ foreach ($f in $staged) {
 if ($leaks) { Fail ("Possible secrets in staged files - fix before pushing:`n  " + ($leaks -join "`n  ")) }
 Ok ("Staged " + $staged.Count + " changed path(s); secret scan clean")
 $wfPath = Join-Path $root ".github/workflows/$Workflow"
-if (-not (Test-Path -LiteralPath $wfPath)) {
-    if ($Workflow -ne "cloud-runner.yml") { Fail ".github/workflows/$Workflow not found in $root" }
-    New-Item -ItemType Directory -Force -Path (Split-Path $wfPath -Parent) -ErrorAction Stop | Out-Null
-    try {
-        [System.IO.File]::WriteAllText($wfPath, ($CloudRunnerYaml.Replace("`r`n", "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
-    } catch {
-        Fail "Could not write ${wfPath}: $($_.Exception.Message)"
+$wfExpected = $CloudRunnerYaml.Replace("`r`n", "`n") + "`n"
+if ($Workflow -eq "cloud-runner.yml" -and -not $KeepWorkflow) {
+    $wfCurrent = if (Test-Path -LiteralPath $wfPath) { [System.IO.File]::ReadAllText($wfPath).Replace("`r`n", "`n") } else { $null }
+    if ($wfCurrent -ne $wfExpected) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $wfPath -Parent) -ErrorAction Stop | Out-Null
+        try {
+            [System.IO.File]::WriteAllText($wfPath, $wfExpected, (New-Object System.Text.UTF8Encoding($false)))
+        } catch {
+            Fail "Could not write ${wfPath}: $($_.Exception.Message)"
+        }
+        Invoke-Git add -- ".github/workflows/$Workflow" | Out-Null
+        $staged = @(& git diff --cached --name-only) | Where-Object { $_ }
+        if ($wfCurrent) { Ok "Updated .github/workflows/$Workflow to the version embedded in this script" }
+        else { Ok "Wrote .github/workflows/$Workflow from the embedded template" }
     }
-    Invoke-Git add -- ".github/workflows/$Workflow" | Out-Null
-    $staged = @(& git diff --cached --name-only) | Where-Object { $_ }
-    Ok "Wrote .github/workflows/$Workflow from the embedded template"
+} elseif (-not (Test-Path -LiteralPath $wfPath)) {
+    Fail ".github/workflows/$Workflow not found in $root"
 }
 
 # ------------------------------------------------------------------ 3. commit + push

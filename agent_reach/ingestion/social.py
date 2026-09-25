@@ -132,6 +132,7 @@ class RedditIngester(BaseIngester):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._json_blocked = False
+        self._rss_lock = asyncio.Lock()
 
     async def fetch(self) -> list[RawTrendItem]:
         subs = self.settings.reddit_subreddits
@@ -149,6 +150,13 @@ class RedditIngester(BaseIngester):
                             self._json_blocked = True
                         self.log.info("r/%s JSON failed (%s); falling back to RSS", sub, str(exc)[:120])
                 try:
+                    if self._json_blocked:
+                        # blocked on JSON => also rate-limited on RSS: one request at a time, spaced out
+                        async with self._rss_lock:
+                            try:
+                                return await self._fetch_rss(sub, per_sub), None
+                            finally:
+                                await asyncio.sleep(self.settings.reddit_rss_spacing_s)
                     return await self._fetch_rss(sub, per_sub), None
                 except IngestionError as exc:
                     return [], f"r/{sub}: {exc}"

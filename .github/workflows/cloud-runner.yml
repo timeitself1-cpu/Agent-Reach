@@ -45,7 +45,9 @@ env:
   # CPU-only runner: give the 8B model room per call and bound the LLM workload
   AGENT_REACH_OLLAMA_TIMEOUT_S: "900"
   AGENT_REACH_MAX_ITEMS_FOR_LLM: "80"
+  AGENT_REACH_LLM_MAX_RETRIES: "1"
   PYTHONIOENCODING: utf-8
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   run-pipeline:
@@ -117,7 +119,10 @@ jobs:
           # shellcheck disable=SC2206
           EXTRA=($EXTRA_ARGS)
           set -o pipefail
-          python -m "$ENTRYPOINT" "${ARGS[@]}" "${EXTRA[@]}" 2> reports/pipeline.log | tee reports/report.txt
+          # stderr (all progress logs) streams live to the job log AND is saved to pipeline.log;
+          # stdout (the final executive report) goes to the log and report.txt
+          python -u -m "$ENTRYPOINT" "${ARGS[@]}" "${EXTRA[@]}" \
+            2> >(tee reports/pipeline.log >&2) | tee reports/report.txt
 
       - name: Publish run summary
         if: always()

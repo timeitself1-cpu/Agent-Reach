@@ -60,21 +60,32 @@ async def run_once(settings: Settings, *, only: list[str] | None = None, use_llm
         await asyncio.to_thread(db.begin_run, run_id, now)
 
         # 1. ingest ---------------------------------------------------------
+        log.info("stage 1/5 ingest: %d sources", len(only or settings.enabled_sources))
+        stage = time.perf_counter()
         raw_items, source_stats = await ingest_all(settings, only)
-        log.info("ingested %d raw items from %d sources", len(raw_items), len(source_stats))
+        log.info(
+            "stage 1/5 ingest: %d raw items in %.1f s (%s)",
+            len(raw_items), time.perf_counter() - stage,
+            ", ".join(f"{s.source}={s.item_count}{'' if s.ok else ' FAIL'}" for s in source_stats),
+        )
 
         # 2. clean ----------------------------------------------------------
         cleaner = TrendCleaner(settings)
         cleaned, breakdown = cleaner.clean(raw_items)
         llm_batch = cleaner.select_for_llm(cleaned)
+        log.info("stage 2/5 clean: %d kept, %d selected for clustering", len(cleaned), len(llm_batch))
 
         # 3. cluster --------------------------------------------------------
         clusterer = SemanticClusterer(settings)
+        stage = time.perf_counter()
+        log.info("stage 3/5 cluster: %s", "LLM" if use_llm else "heuristic")
         if use_llm:
-            clusters, discarded, mode = await clusterer.cluster(llm_batch)
+            clusters, discarded, mode = await clusterer.cluster(llm_batch, corpus=cleaned)
         else:
             clusters, discarded = clusterer.heuristic_cluster(llm_batch)
             mode = "heuristic (--no-llm)"
+
+        log.info("stage 3/5 cluster: %d clusters via %s in %.0f s", len(clusters), mode, time.perf_counter() - stage)
 
         # 4. score ----------------------------------------------------------
         scorer = TrendScorer(settings, db)
@@ -94,6 +105,8 @@ async def run_once(settings: Settings, *, only: list[str] | None = None, use_llm
             filter_breakdown=breakdown,
         )
 
+        log.info("stage 4/5 score: done")
+
         # 5. persist --------------------------------------------------------
         await asyncio.to_thread(db.save_items, run_id, raw_items, cleaned, now)
         await asyncio.to_thread(db.save_clusters, run_id, clusters)
@@ -101,6 +114,7 @@ async def run_once(settings: Settings, *, only: list[str] | None = None, use_llm
         report.execution_time = round(time.perf_counter() - t0, 2)
         await asyncio.to_thread(db.finish_run, report, time.time())
         await asyncio.to_thread(db.purge_older_than, settings.retention_days)
+        log.info("stage 5/5 persist: run %s saved (%.0f s total)", run_id, report.execution_time)
         return report
     finally:
         db.close()
