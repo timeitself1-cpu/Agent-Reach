@@ -64,9 +64,9 @@ jobs:
           echo "  no_llm           : $NO_LLM"
           echo "  commit           : $GITHUB_SHA"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -76,7 +76,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Restore velocity history (SQLite)
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: state
           key: agent-reach-db-${{ github.run_id }}
@@ -85,7 +85,7 @@ jobs:
       - name: Restore Ollama model cache
         if: env.NO_LLM != 'true'
         id: model-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ~/.ollama/models
           key: ollama-models-llama3.1-8b-nomic-embed-text
@@ -108,7 +108,7 @@ jobs:
 
       - name: Save Ollama model cache
         if: env.NO_LLM != 'true' && steps.model-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/.ollama/models
           key: ollama-models-llama3.1-8b-nomic-embed-text
@@ -142,14 +142,14 @@ jobs:
 
       - name: Save velocity history (SQLite)
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: state
           key: agent-reach-db-${{ github.run_id }}
 
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: agent-reach-report-${{ github.run_id }}
           path: |

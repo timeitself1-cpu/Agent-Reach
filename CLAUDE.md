@@ -11,7 +11,7 @@ python -m pyflakes agent_reach tests    # must be clean
 python -m agent_reach --no-llm --help   # CLI smoke test
 ```
 
-Every change must leave `pytest` green and `pyflakes` clean. Add or extend tests in `tests/` for any behaviour you change. `tests/fakes.py` holds the mock sources and the fake Ollama.
+Every change must leave `pytest` green and `pyflakes` clean. `.github/workflows/tests.yml` runs both (plus the CLI smoke test) on every push and pull request. Add or extend tests in `tests/` for any behaviour you change. `tests/fakes.py` holds the mock sources and the fake Ollama.
 
 ## Environment limits (cloud sessions)
 
@@ -42,7 +42,6 @@ Every change must leave `pytest` green and `pyflakes` clean. Add or extend tests
 - Similarity thresholds (`density_member_min_cosine=0.55`, `hdbscan_selection="leaf"`) are defaults for `nomic-embed-text`. They have not been calibrated on real output yet. Use the `stage 3a density` log line from a cloud-runner artifact to tune them.
 - Google News links are `news.google.com` redirect pages with no article text, so those items get no context.
 - Reddit is usually blocked from data-centre IPs (CI). The robust fix is Reddit's OAuth API, with credentials as GitHub secrets.
-- The GitHub Actions used in `cloud-runner.yml` target Node 20, which is deprecated. Bump the action major versions when convenient.
 
 ## Roadmap
 
