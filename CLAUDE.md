@@ -7,7 +7,7 @@ Agent Reach is **Module 1** of a modular trend-intelligence system. It ingests t
 ```bash
 pip install -r requirements-dev.txt     # runtime deps + pytest + pyflakes
 python -m pytest                        # offline suite (~15 s): mock HTTP + fake Ollama, real HDBSCAN/trafilatura/SQLite
-python -m pyflakes agent_reach tests    # must be clean
+python -m pyflakes agent_reach paperclip_bridge tests    # must be clean
 python -m agent_reach --no-llm --help   # CLI smoke test
 python -m agent_reach chat              # local chat page (agent_reach/chat/): latest local or cloud report + Ollama
 ```
@@ -49,3 +49,4 @@ Every change must leave `pytest` green and `pyflakes` clean. `.github/workflows/
 - **Module 2, Agent Depth:** reads `PipelineReport` JSON (the contract above), fetches 3-5 sources per top trend, checks cross-source agreement, and writes cited `TrendBrief` records. It must depend on the JSON contract only, never on Agent Reach imports.
 - **Module 3:** delivery and watchlists (digest, velocity alerts). The `chat` page (`agent_reach/chat/`) is the first delivery surface: it only reads `PipelineReport` data and the SQLite history, and never changes them.
 - **Module 4:** actions.
+- **`paperclip_bridge/`:** runs a Paperclip-unaware research CLI from a Paperclip heartbeat through a JSON file contract (`contract.py`, `schema_version`). It never imports `agent_reach`. See `paperclip_bridge/README.md`.
