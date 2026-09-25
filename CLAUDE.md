@@ -16,7 +16,7 @@ Every change must leave `pytest` green and `pyflakes` clean. `.github/workflows/
 ## Environment limits (cloud sessions)
 
 - **No Ollama or live data here.** The cloud sandbox has no Ollama and cannot reach most source sites, so never try a live run. Verify with the offline tests.
-- **Real-data runs happen in GitHub Actions.** The `.github/workflows/cloud-runner.yml` workflow is started manually (`workflow_dispatch`). It installs Ollama with `llama3.1:8b` and `nomic-embed-text` on a CPU runner and uploads `report.txt`, the JSON report and `pipeline.log` as an artifact. When a change needs real-data validation, say so in the PR description. The user will run the workflow and share the artifact.
+- **Real-data runs happen in GitHub Actions.** The `.github/workflows/cloud-runner.yml` workflow is started manually (`workflow_dispatch`). It installs Ollama with `nomic-embed-text` and the labelling model chosen by its `model` input (default `llama3.2:3b`; `llama3.1:8b` generates only ~5 tok/s on the no-GPU runner) on a CPU runner and uploads `report.txt`, the JSON report and `pipeline.log` as an artifact. When a change needs real-data validation, say so in the PR description. The user will run the workflow and share the artifact.
 - **`.ps1` scripts run on Windows PowerShell 5.1.** Keep `$ErrorActionPreference = "Continue"` with explicit `$LASTEXITCODE` checks, because 5.1 turns native stderr into terminating errors. Avoid PowerShell 7-only syntax (`??`, ternary `? :`, `&&`).
 
 ## Invariants: do not break these
