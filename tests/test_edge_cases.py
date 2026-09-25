@@ -96,7 +96,7 @@ def test_reddit_retries_pacing_and_budget():
     state = {"n": 0}
 
     def rh(req):
-        stamps.append(time.monotonic())
+        stamps.append(time.perf_counter())
         if req.url.path.endswith(".json"):
             return httpx.Response(403, text="Blocked")
         state["n"] += 1
@@ -108,9 +108,9 @@ def test_reddit_retries_pacing_and_budget():
 
     async def go():
         async with RealAsyncClient(transport=httpx.MockTransport(rh)) as cl:
-            t0 = time.monotonic()
+            t0 = time.perf_counter()
             items, stat = await RedditIngester(cl, s, asyncio.Semaphore(8)).run()
-            return items, stat, time.monotonic() - t0
+            return items, stat, time.perf_counter() - t0
 
     items, stat, dt = asyncio.run(go())
     assert stat.ok and items
@@ -118,11 +118,29 @@ def test_reddit_retries_pacing_and_budget():
     assert dt < 4.5
 
 
+def test_pace_never_starts_requests_closer_than_interval():
+    # Exact bound on the recorded start times: no tolerance, even though the event loop
+    # may wake a sleep early by one monotonic tick (~15.6 ms on Windows).
+    s = Settings(reddit_request_spacing_s=0.05)
+
+    async def go():
+        async with RealAsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200))) as cl:
+            ing = RedditIngester(cl, s, asyncio.Semaphore(8))
+            starts = []
+            for _ in range(12):
+                await ing._pace()
+                starts.append(ing._last_request_at)
+            return starts
+
+    starts = asyncio.run(go())
+    assert min(b - a for a, b in zip(starts, starts[1:])) >= 0.05
+
+
 def test_tiktok_paced_retries_then_clean_fail():
     stamps: list[float] = []
 
     def th(req):
-        stamps.append(time.monotonic())
+        stamps.append(time.perf_counter())
         return httpx.Response(429 if len(stamps) < 3 else 403)
 
     s = Settings(tiktok_request_spacing_s=0.3, http_backoff_base_s=0.05)
