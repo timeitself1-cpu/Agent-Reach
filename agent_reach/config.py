@@ -80,7 +80,8 @@ class Settings(BaseSettings):
         default_factory=lambda: [
             "x_trends24",
             "reddit",
-            "tiktok",
+            # "tiktok": off by default. TikTok Creative Center bot-gates unauthenticated requests
+            # (FAIL in every cloud run); opt in with --sources ... tiktok or AGENT_REACH_ENABLED_SOURCES.
             "google_trends",
             "google_news",
             "wikipedia",

@@ -43,7 +43,7 @@ python -m agent_reach --json-out reports/latest.json --log-level DEBUG
 
 ## Pipeline stages
 
-1. **Ingest.** Eleven sources are fetched concurrently. A failing source returns no items; it never fails the run.
+1. **Ingest.** Ten sources are fetched concurrently by default (TikTok is opt-in, see below). A failing source returns no items; it never fails the run.
 2. **Clean and select.** Engagement thresholds, noise regexes and de-duplication run first. Then the top `MAX_ITEMS_FOR_LLM` items, with a floor per source, become clustering candidates.
 3. **Enrich (2b).** Each candidate gets `context`: page title, meta description and 1-2 lead paragraphs.
    - Wikipedia uses its summary API.
@@ -89,7 +89,7 @@ For each entity: `rate = % of kept items mentioning it`. For each lookback windo
 
 - Titles are folded to ASCII (as specified), so non-Latin-script trends are discarded. For another region, change `AGENT_REACH_GEO`, `TRENDS24_REGION` and `WIKIPEDIA_PROJECT`.
 - Trends24, GitHub Trending and TikTok are HTML scrapes. When their markup changes, the ingester reports `FAIL` in SOURCE HEALTH and the run continues.
-- TikTok Creative Center often bot-gates unauthenticated requests. Expect intermittent `FAIL` from that source.
+- TikTok Creative Center bot-gates unauthenticated requests, so TikTok is **off by default** (it failed in every cloud run). Opt in with `--sources ... tiktok` or `AGENT_REACH_ENABLED_SOURCES`; expect `FAIL` from data-centre IPs.
 - Unreachable Ollama, a missing model or invalid JSON all fall back to deterministic grouping and heuristic labels. The engine and the grouping method are shown in the report header.
 - `density_member_min_cosine` (0.55) and `hdbscan_selection` (`leaf`) are tuned for `nomic-embed-text`. If you change the embedding model, re-check the `stage 3a density` log line.
 

@@ -1,6 +1,6 @@
 # Agent Reach: guide for Claude
 
-Agent Reach is **Module 1** of a modular trend-intelligence system. It ingests trend signals from 11 sources, filters noise, enriches items with page content, groups them by embedding density, has a local LLM (`llama3.1:8b` via Ollama) label the groups, scores relevance and velocity, and writes an ASCII executive report plus SQLite history. Read `README.md` for the full architecture.
+Agent Reach is **Module 1** of a modular trend-intelligence system. It ingests trend signals from 10 sources by default (TikTok is opt-in), filters noise, enriches items with page content, groups them by embedding density, has a local LLM (`llama3.1:8b` via Ollama) label the groups, scores relevance and velocity, and writes an ASCII executive report plus SQLite history. Read `README.md` for the full architecture.
 
 ## Commands
 
