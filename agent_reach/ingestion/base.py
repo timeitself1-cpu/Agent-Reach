@@ -118,17 +118,21 @@ class BaseIngester(abc.ABC):
         self.semaphore = semaphore
         self.log = logging.getLogger(f"agent_reach.ingest.{self.source.value}")
         self._pace_lock = asyncio.Lock()
-        self._last_request_at = 0.0
+        self._last_request_at = float("-inf")
 
     async def _pace(self) -> None:
-        """Serialise request starts so they are at least ``min_request_interval_s`` apart."""
+        """Serialise request starts so they are at least ``min_request_interval_s`` apart.
+
+        Uses ``perf_counter`` (``monotonic`` ticks at ~15.6 ms on Windows) and re-checks after
+        each sleep, because the event loop may wake a timer up to one clock tick early.
+        """
         if self.min_request_interval_s <= 0:
             return
         async with self._pace_lock:
-            wait = self._last_request_at + self.min_request_interval_s - time.monotonic()
-            if wait > 0:
+            due = self._last_request_at + self.min_request_interval_s
+            while (wait := due - time.perf_counter()) > 0:
                 await asyncio.sleep(wait)
-            self._last_request_at = time.monotonic()
+            self._last_request_at = time.perf_counter()
 
     # ------------------------------------------------------------ headers
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
