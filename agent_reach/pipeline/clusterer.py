@@ -59,6 +59,8 @@ log = logging.getLogger(__name__)
 #: llama3.1:8b starts dropping commas / truncating JSON above ~25 items per call.
 MAX_BATCH_SIZE = 25
 MIN_BATCH_SIZE = 5
+#: generation cap per label call; bounded schemas keep a valid answer far below it
+NUM_PREDICT = 2048
 HEADLINE_MAX_WORDS = 10
 
 CATEGORY_ALIASES: dict[str, CategoryEnum] = {
@@ -147,20 +149,31 @@ FILLER_RX = re.compile(
 
 
 # ======================================================================= schemas
-def _relabel_schema() -> dict[str, Any]:
+def _relabel_schema(n_groups: int, n_offered: int) -> dict[str, Any]:
+    """Output schema for one label call, bounded so constrained decoding cannot loop.
+
+    Unbounded arrays let llama3.1:8b repeat entities or assignments until ``num_predict``
+    runs out (2048 tokens of truncated JSON for a 5-group call in cloud-runner run 36127841328).
+    """
     return {
         "type": "object",
         "properties": {
             "groups": {
                 "type": "array",
+                "minItems": n_groups,
+                "maxItems": n_groups,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "group_id": {"type": "integer"},
-                        "headline": {"type": "string"},
+                        "group_id": {"type": "integer", "minimum": 1, "maximum": max(1, n_groups)},
+                        "headline": {"type": "string", "maxLength": 100},
                         "category": {"type": "string", "enum": CategoryEnum.values()},
-                        "primary_entities": {"type": "array", "items": {"type": "string"}},
-                        "summary": {"type": "string"},
+                        "primary_entities": {
+                            "type": "array",
+                            "maxItems": 5,
+                            "items": {"type": "string", "maxLength": 60},
+                        },
+                        "summary": {"type": "string", "maxLength": 400},
                         "relevance_score": {"type": "integer", "minimum": 1, "maximum": 10},
                     },
                     "required": ["group_id", "headline", "category", "primary_entities", "summary", "relevance_score"],
@@ -168,9 +181,13 @@ def _relabel_schema() -> dict[str, Any]:
             },
             "assignments": {
                 "type": "array",
+                "maxItems": n_offered,
                 "items": {
                     "type": "object",
-                    "properties": {"item_id": {"type": "integer"}, "group_id": {"type": "integer"}},
+                    "properties": {
+                        "item_id": {"type": "integer", "minimum": 1, "maximum": max(1, n_offered)},
+                        "group_id": {"type": "integer", "minimum": 0, "maximum": max(1, n_groups)},
+                    },
                     "required": ["item_id", "group_id"],
                 },
             },
@@ -310,6 +327,14 @@ def clean_entities(entities: list[str], limit: int = 6) -> list[str]:
         if len(out) >= limit:
             break
     return out
+
+
+def _excerpt(text: str, limit: int) -> str:
+    """At most ``limit`` chars, cut at a word boundary."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:-") + "..."
 
 
 def _item_text(it: CleanedTrendItem) -> str:
@@ -509,12 +534,16 @@ class SemanticClusterer:
         * logs duration and generation speed (tokens/s) when the call returns
         * a timeout is NOT retried: re-sending the same prompt to an overloaded CPU would only
           burn another full timeout window; the caller falls back to heuristics instead
+        * neither is output cut off at ``num_predict``: at low temperature the same prompt
+          runs away the same way again
         """
         client = self._get_client()
         last_exc: Exception | None = None
         for attempt in range(self.settings.llm_max_retries + 1):
             started = time.perf_counter()
             heartbeat = asyncio.create_task(self._heartbeat(label, started))
+            content: str | None = None
+            resp: Any = None
             try:
                 resp = await client.chat(
                     model=self.settings.ollama_model,
@@ -523,7 +552,7 @@ class SemanticClusterer:
                     options={
                         "temperature": self.settings.ollama_temperature,
                         "num_ctx": self.settings.ollama_num_ctx,
-                        "num_predict": 2048,
+                        "num_predict": NUM_PREDICT,
                     },
                     keep_alive=self.settings.ollama_keep_alive,
                 )
@@ -535,7 +564,14 @@ class SemanticClusterer:
                 return extract_json(content or "")
             except json.JSONDecodeError as exc:
                 last_exc = exc
-                log.warning("%s: invalid JSON (attempt %d): %s", label, attempt + 1, exc)
+                tail = normalize_text((content or "")[-200:])
+                log.warning("%s: invalid JSON (attempt %d): %s | output ends: ...%s", label, attempt + 1, exc, tail)
+                gen = getattr(resp, "eval_count", None)
+                if gen is None and isinstance(resp, dict):
+                    gen = resp.get("eval_count")
+                if gen is not None and gen >= NUM_PREDICT:
+                    log.warning("%s: output hit the %d-token cap - not retrying (falls back to heuristics)", label, NUM_PREDICT)
+                    raise ClusteringError(f"{label} output truncated at {NUM_PREDICT} tokens") from exc
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 msg = str(exc).lower()
@@ -663,19 +699,22 @@ class SemanticClusterer:
                 )
                 d.needs_label = False
 
-    @staticmethod
-    def _render_item(it: CleanedTrendItem) -> str:
+    def _render_item(self, it: CleanedTrendItem) -> str:
         src = it.source.value
         if it.source is SourceName.REDDIT and it.metadata.get("subreddit"):
             src = f"reddit/r/{it.metadata['subreddit']}"
         hint = it.category_hint.value if it.category_hint else "-"
         ctx = ""
         if it.context:
-            ctx = normalize_text(it.context)[:260]
+            ctx = normalize_text(it.context)
+            title = normalize_text(it.normalized_title)
+            if title and ctx.lower().startswith(title.lower()):  # page title repeats the signal title
+                ctx = ctx[len(title):].lstrip(" .:-|")
         elif it.source is SourceName.GOOGLE_TRENDS and it.metadata.get("news_titles"):
-            ctx = normalize_text(" / ".join(it.metadata["news_titles"][:2]))[:160]
+            ctx = normalize_text(" / ".join(it.metadata["news_titles"][:2]))
         elif it.description:
-            ctx = normalize_text(it.description)[:160]
+            ctx = normalize_text(it.description)
+        ctx = _excerpt(ctx, self.settings.llm_context_chars)
         return f"{src} | {hint} | {it.normalized_title[:200]} | " + (ctx if ctx else "(no context)")
 
     # ....................................................... coherence
@@ -811,10 +850,15 @@ class SemanticClusterer:
             return drafts, orphans
 
         remaining_orphans = list(orphans)
+        per_group = self.settings.llm_items_per_group
+
+        def shown_count(ds: list[DraftCluster]) -> int:
+            return sum(min(len(d.item_ids), per_group) for d in ds)
+
         chunk: list[DraftCluster] = []
         chunks: list[list[DraftCluster]] = []
         for d in sorted(pending, key=lambda x: -len(x.item_ids)):
-            if chunk and sum(len(c.item_ids) for c in chunk) + len(d.item_ids) > self.batch_size:
+            if chunk and shown_count(chunk + [d]) > self.batch_size:
                 chunks.append(chunk)
                 chunk = []
             chunk.append(d)
@@ -822,13 +866,17 @@ class SemanticClusterer:
             chunks.append(chunk)
 
         for ci, group_chunk in enumerate(chunks, start=1):
-            room = max(0, self.batch_size - sum(len(d.item_ids) for d in group_chunk))
+            room = max(0, self.batch_size - shown_count(group_chunk))
             offered = remaining_orphans[: max(room, 5)]
             lines: list[str] = []
             for gi, d in enumerate(group_chunk, start=1):
                 lines.append(f"Group {gi}:")
-                for m in d.item_ids[:10]:
+                # members arrive most central first (density order); the rest add tokens, not facts
+                shown = d.item_ids[:per_group]
+                for m in shown:
                     lines.append(f"  - {self._render_item(by_id[m])}")
+                if len(d.item_ids) > len(shown):
+                    lines.append(f"  (+{len(d.item_ids) - len(shown)} more similar signals)")
             if offered:
                 lines.append("")
                 lines.append("Unassigned signals (id | source | hint | title | context):")
@@ -836,9 +884,14 @@ class SemanticClusterer:
                     lines.append(f"{oi} | {self._render_item(by_id[o])}")
             lines.append("")
             lines.append(f"Label groups 1..{len(group_chunk)}" + (" and assign each unassigned signal." if offered else "."))
-            log.info("LLM label %d/%d (%d groups, %d items, %d unassigned)", ci, len(chunks), len(group_chunk), sum(len(d.item_ids) for d in group_chunk), len(offered))
+            log.info(
+                "LLM label %d/%d (%d groups, %d items, %d shown, %d unassigned)",
+                ci, len(chunks), len(group_chunk), sum(len(d.item_ids) for d in group_chunk), shown_count(group_chunk), len(offered),
+            )
             try:
-                data = await self._chat_json(CLUSTER_SYSTEM_PROMPT, "\n".join(lines), _relabel_schema(), f"label {ci}/{len(chunks)}")
+                data = await self._chat_json(
+                    CLUSTER_SYSTEM_PROMPT, "\n".join(lines), _relabel_schema(len(group_chunk), len(offered)), f"label {ci}/{len(chunks)}"
+                )
                 parsed = _RelabelResponse.model_validate(data)
             except (ClusteringError, ValueError) as exc:
                 log.warning("relabel pass failed (%s); using heuristic labels", exc)
