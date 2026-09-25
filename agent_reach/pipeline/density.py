@@ -85,9 +85,13 @@ async def embed_items(client, settings: Settings, items: list[CleanedTrendItem])
 
 
 def _cosine_gate(ids: list[int], vecs: dict[int, list[float]], min_cos: float) -> tuple[list[int], list[int]]:
-    """Iteratively drop the member least similar to the centroid until all pass the gate."""
+    """Iteratively drop the member least similar to the centroid until all pass the gate.
+
+    Kept members are returned most central first, so the labeller can show only the top few.
+    """
     members = list(ids)
     rejected: list[int] = []
+    sims: dict[int, float] = {}
     while len(members) >= 2:
         dim = len(vecs[members[0]])
         centroid = [sum(vecs[m][d] for m in members) / len(members) for d in range(dim)]
@@ -102,7 +106,7 @@ def _cosine_gate(ids: list[int], vecs: dict[int, list[float]], min_cos: float) -
     if len(members) < 2:
         rejected.extend(members)
         members = []
-    return members, rejected
+    return sorted(members, key=lambda m: -sims[m]), rejected
 
 
 def _threshold_groups(ids: list[int], vecs: dict[int, list[float]], threshold: float) -> tuple[list[list[int]], list[int]]:
