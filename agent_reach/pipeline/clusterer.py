@@ -613,9 +613,9 @@ class SemanticClusterer:
 
         # ---- 3b label, 3c isolate (+ re-label split parts, offer strays back to them)
         if llm_ok:
-            drafts, _ = await self._relabel(drafts, [], by_id)
+            drafts, _ = await self._relabel(drafts, [], by_id, index)
             drafts, orphans = self._enforce_coherence(drafts, index)
-            drafts, orphans = await self._relabel(drafts, orphans, by_id)
+            drafts, orphans = await self._relabel(drafts, orphans, by_id, index)
             mode = f"ollama:{self.settings.ollama_model} + {method}"
         else:
             self._heuristic_labels(drafts, by_id)
@@ -781,10 +781,29 @@ class SemanticClusterer:
                 kept.append(e)
         return kept
 
+    @staticmethod
+    def _assignment_supported(orphan: int, draft: DraftCluster, index: LinkIndex) -> bool:
+        """Evidence that an LLM-proposed orphan belongs to ``draft``.
+
+        The orphan must share distinctive tokens with a member, or literally name one of the
+        draft's entities that its own members name. The LLM's word alone never groups items.
+        """
+        if any(index.linked(orphan, m) for m in draft.item_ids):
+            return True
+        grounded = SemanticClusterer._ground_entities(draft.entities, draft.item_ids, index)
+        return any(index.mentions(orphan, e) for e in grounded)
+
     async def _relabel(
-        self, drafts: list[DraftCluster], orphans: list[int], by_id: dict[int, CleanedTrendItem]
+        self,
+        drafts: list[DraftCluster],
+        orphans: list[int],
+        by_id: dict[int, CleanedTrendItem],
+        index: LinkIndex,
     ) -> tuple[list[DraftCluster], list[int]]:
-        """LLM labels re-grouped drafts and may re-home orphans into them (never regroups)."""
+        """LLM labels re-grouped drafts and proposes homes for orphans (never regroups).
+
+        A proposed home is kept only when ``_assignment_supported`` finds evidence for it.
+        """
         pending = [d for d in drafts if d.needs_label]
         if not pending and not orphans:
             return drafts, []
@@ -837,12 +856,22 @@ class SemanticClusterer:
                         h.headline, h.category_raw, h.summary, h.entities, h.relevance,
                     )
                 d.needs_label = False
+            accepted = rejected = 0
             for a in parsed.assignments:
                 if 1 <= a.item_id <= len(offered) and 1 <= a.group_id <= len(group_chunk):
                     oid = offered[a.item_id - 1]
-                    if oid in remaining_orphans:
-                        group_chunk[a.group_id - 1].item_ids.append(oid)
-                        remaining_orphans.remove(oid)
+                    if oid not in remaining_orphans:
+                        continue
+                    target = group_chunk[a.group_id - 1]
+                    if not self._assignment_supported(oid, target, index):
+                        rejected += 1
+                        log.debug("LLM assignment rejected (no evidence): %r -> %r", by_id[oid].normalized_title[:80], target.headline[:60])
+                        continue
+                    target.item_ids.append(oid)
+                    remaining_orphans.remove(oid)
+                    accepted += 1
+            if accepted or rejected:
+                log.info("label %d/%d: LLM assignments %d accepted, %d rejected (no token/entity evidence)", ci, len(chunks), accepted, rejected)
         return drafts, remaining_orphans
 
     # ....................................................... merging

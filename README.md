@@ -51,7 +51,7 @@ python -m agent_reach --json-out reports/latest.json --log-level DEBUG
 4. **Cluster (3a-3e).**
    - **3a density:** embed `title + context`, run HDBSCAN (`min_cluster_size=2`, leaf selection), then apply a cosine-to-centroid gate. Outliers are noise and are dropped. They are never forced into a mixed bucket.
    - **3b label:** the LLM only names groups (headline, category, entities, two sentences, relevance). Groups whose signals can't explain what happened and why get `[INSUFFICIENT_DATA]`.
-   - **3c entity isolation:** a group must be connected by distinctive tokens, a shared named entity, or entities that co-occur elsewhere in the run. Mixed groups are split and re-labelled. An orphan re-joins a cluster only when it literally names that cluster's grounded entity.
+   - **3c entity isolation:** a group must be connected by distinctive tokens, a shared named entity, or entities that co-occur elsewhere in the run. Mixed groups are split and re-labelled. An orphan re-joins a cluster only when it literally names that cluster's grounded entity. The LLM may propose a home for an orphan, but the proposal is kept only when the orphan shares distinctive tokens with a member or names a grounded entity.
    - **3d merge:** groups that resolve to identical entities are merged.
    - **3e drop:** clusters flagged `[INSUFFICIENT_DATA]`, with filler summaries ("no specific information", "details are scarce"), or with relevance <= 3 are dropped, as are weak singletons.
 5. **Score and persist.** Relevance and velocity are computed, then everything is saved to SQLite.
