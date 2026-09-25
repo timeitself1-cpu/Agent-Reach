@@ -91,6 +91,51 @@ def main() -> int:
 raise SystemExit(main())
 ```
 
+## Windows drop-in files (`templates/`)
+
+| File | Goes to | Purpose |
+|---|---|---|
+| `templates/research_agent/cli.py` | `<toolkit>\research_agent\cli.py` | `--in/--out` wrapper around your LangGraph graph (stdlib only) |
+| `templates/run_research_node.ps1` | anywhere, e.g. `<toolkit>\` | Ollama settings, msvcrt lock self-test, wrapper test, apply config, live test |
+| `templates/paperclip.yaml` | next to the script | Agent adapter and heartbeat config, applied through Paperclip's agent API |
+
+`cli.py` loads the graph named by `RESEARCH_AGENT_GRAPH` (`module:attribute`;
+a compiled graph, a `StateGraph`, or a factory). It maps the request to
+`{"topic", "instructions", "request_id"}` and reads `papers`, `summary` and
+`handoff` from the final state. Edit `build_input_state` and `extract_output`
+if your state uses other keys. Any exception becomes `status: "error"`. When
+the graph returns no hand-off, one is built from the most confident paper that
+has `implementation_notes` (`RESEARCH_AGENT_AUTO_HANDOFF`,
+`RESEARCH_AGENT_HANDOFF_MIN_CONFIDENCE`).
+
+```powershell
+# 1. lock + Ollama (restarts Ollama so OLLAMA_MAX_LOADED_MODELS/NUM_PARALLEL=1 apply)
+.\run_research_node.ps1 -Mode Check -BridgeRoot C:\dev\Agent-Reach -RestartOllama
+# 2. one real graph run through the wrapper, result checked against the contract
+.\run_research_node.ps1 -Mode Wrapper -BridgeRoot C:\dev\Agent-Reach -ResearchRoot C:\dev\research-toolkit
+# 3. create/update the Paperclip agent, then assign a smoke-test ticket and wait
+.\run_research_node.ps1 -Mode Apply    -BridgeRoot C:\dev\Agent-Reach
+.\run_research_node.ps1 -Mode LiveTest -BridgeRoot C:\dev\Agent-Reach
+```
+
+Helper commands used by the script:
+
+* `python -m paperclip_bridge lock-selftest [LOCK_PATH]`: cross-process lock
+  check (blocked while held, handed over on release, freed when the holder is
+  killed). Prints the backend: `msvcrt` on Windows, `fcntl` elsewhere.
+* `python -m paperclip_bridge validate RESULT.json`: checks a result file
+  against the contract.
+* `python -m paperclip_bridge.setup_agent apply|smoke --config paperclip.yaml`:
+  applies the YAML through `POST /api/companies/{id}/agents` or
+  `PATCH /api/agents/{id}`, or runs the live smoke test. A local Paperclip
+  (`local_trusted`) needs no credentials; otherwise set `PAPERCLIP_BOARD_TOKEN`.
+
+`paperclip.yaml` is not Paperclip's company-export `.paperclip.yaml`: importing
+one of those forces `heartbeat.enabled` to false.
+
+The bridge removes every `PAPERCLIP_*` variable from the CLI's environment, so
+the research CLI never sees the run token.
+
 ## Paperclip agent setup
 
 Adapter `process`:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from typing import Any, TextIO
 
 from pydantic import ValidationError
 
+from . import gpu_lock
 from .client import PaperclipClient
 from .config import BridgeSettings, PaperclipEnv
 from .contract import ResearchRequest, ResearchResult
@@ -39,6 +41,11 @@ def _tail(path: Path) -> str:
         return ""
 
 
+def cli_environment() -> dict[str, str]:
+    """The bridge's environment minus Paperclip's: the CLI never sees the run token."""
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("PAPERCLIP_")}
+
+
 def run_cli(settings: BridgeSettings, issue: dict[str, Any], run_id: str) -> CliOutcome:
     """Write request.json, run the CLI, read result.json. Never raises for CLI problems."""
     label = issue.get("identifier") or issue["id"]
@@ -59,7 +66,7 @@ def run_cli(settings: BridgeSettings, issue: dict[str, Any], run_id: str) -> Cli
     try:
         with open(stdout_log, "wb") as so, open(stderr_log, "wb") as se:
             proc = subprocess.run(
-                argv, cwd=settings.cwd, stdout=so, stderr=se,
+                argv, cwd=settings.cwd, stdout=so, stderr=se, env=cli_environment(),
                 stdin=subprocess.DEVNULL, timeout=settings.timeout_s,
             )
     except subprocess.TimeoutExpired:
@@ -201,8 +208,26 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"request": ResearchRequest.model_json_schema(),
                           "result": ResearchResult.model_json_schema()}, indent=2))
         return 0
+    if args[:1] == ["validate"] and len(args) == 2:
+        try:
+            result = ResearchResult.model_validate_json(Path(args[1]).read_bytes())
+        except (OSError, ValidationError) as exc:
+            print(f"invalid result file {args[1]}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({"valid": True, "status": result.status, "papers": len(result.papers),
+                          "handoff": result.handoff is not None}))
+        return 0
+    if args[:1] == ["lock-selftest"] and len(args) <= 2:
+        path = Path(args[1]) if len(args) == 2 else BridgeSettings().gpu_lock_path
+        failures = gpu_lock.selftest(path)
+        print(json.dumps({"backend": gpu_lock.BACKEND, "lock_path": str(path), "ok": not failures,
+                          "failures": failures}))
+        return 0 if not failures else 1
+    if args[:1] == ["lock-hold"] and len(args) == 3:
+        return gpu_lock.hold(Path(args[1]), float(args[2]))
     if args:
-        print("usage: python -m paperclip_bridge [schema]", file=sys.stderr)
+        print("usage: python -m paperclip_bridge [schema | validate RESULT.json | lock-selftest [LOCK_PATH]]",
+              file=sys.stderr)
         return 2
     try:
         settings = BridgeSettings()

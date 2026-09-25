@@ -42,7 +42,16 @@ class BridgeSettings(BaseSettings):
         return v
 
     def cmd_argv(self) -> list[str]:
-        return shlex.split(self.cmd, posix=os.name != "nt")
+        return split_command(self.cmd, windows=os.name == "nt")
+
+
+def split_command(cmd: str, *, windows: bool) -> list[str]:
+    """Split a command line. Windows mode keeps backslashes and drops the quotes
+    around tokens such as ``"C:\\Program Files\\Python\\python.exe"``."""
+    if not windows:
+        return shlex.split(cmd)
+    parts = shlex.split(cmd, posix=False)
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in parts]
 
 
 @dataclass(frozen=True)

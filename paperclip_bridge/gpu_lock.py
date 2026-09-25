@@ -74,3 +74,66 @@ class GpuLock:
 
     def __exit__(self, *exc: object) -> None:
         self.release()
+
+
+BACKEND = "msvcrt" if os.name == "nt" else "fcntl"
+
+
+def hold(path: Path, hold_s: float) -> int:
+    """Take the lock, print 'held', keep it for ``hold_s`` seconds. Used by ``selftest``."""
+    with GpuLock(path, wait_s=10.0) as got:
+        if not got:
+            print("busy", flush=True)
+            return 1
+        print("held", flush=True)
+        time.sleep(hold_s)
+    return 0
+
+
+def selftest(path: Path, hold_s: float = 2.0) -> list[str]:
+    """Cross-process lock checks. Returns failure messages; empty means the lock works.
+
+    1. A lock held by another process blocks a non-waiting acquire.
+    2. A waiting acquire gets the lock once the holder releases it.
+    3. A lock held by a killed process is freed by the OS.
+    """
+    import subprocess
+    import sys
+
+    def spawn(seconds: float) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [sys.executable, "-m", "paperclip_bridge", "lock-hold", str(path), str(seconds)],
+            stdout=subprocess.PIPE, text=True,
+        )
+
+    failures: list[str] = []
+    holder = spawn(hold_s)
+    try:
+        if (holder.stdout.readline() if holder.stdout else "").strip() != "held":
+            return [f"helper process could not take the lock at {path}"]
+        with GpuLock(path, wait_s=0.0) as got:
+            if got:
+                failures.append("lock was acquired while another process held it")
+        start = time.monotonic()
+        with GpuLock(path, wait_s=hold_s + 15.0) as got:
+            if not got:
+                failures.append("lock was not handed over after the holder released it")
+            elif time.monotonic() - start < hold_s * 0.5:
+                failures.append("waiting acquire returned before the holder released the lock")
+    finally:
+        holder.wait(timeout=hold_s + 30.0)
+
+    crashed = spawn(600.0)
+    try:
+        if (crashed.stdout.readline() if crashed.stdout else "").strip() != "held":
+            failures.append("second helper process could not take the lock")
+            return failures
+        crashed.kill()
+        crashed.wait(timeout=30.0)
+    finally:
+        if crashed.poll() is None:
+            crashed.kill()
+    with GpuLock(path, wait_s=10.0) as got:
+        if not got:
+            failures.append("lock stayed held after the holding process was killed")
+    return failures

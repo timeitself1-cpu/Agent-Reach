@@ -1,0 +1,57 @@
+# Paperclip agent config for the research node (Windows).
+#
+# Not Paperclip's company-export ".paperclip.yaml" (importing one of those
+# forces heartbeat.enabled to false). The "agent" block has the same shape as
+# Paperclip's agent API. Apply or re-apply it with:
+#
+#   python -m paperclip_bridge.setup_agent apply --config paperclip.yaml
+#   (or: .\run_research_node.ps1 -Mode Apply)
+#
+# The same values can be entered by hand in the agent's settings in the Paperclip UI.
+# Single-quoted YAML strings keep Windows backslashes literal.
+
+paperclip:
+  apiUrl: 'http://localhost:3100'
+  companyId: ''            # blank = the only company on this instance
+
+agent:
+  name: 'Research Agent'   # apply matches an existing agent by this name
+  role: researcher
+  title: 'AI literature researcher'
+  capabilities: 'Tracks and synthesises AI papers (arXiv, dair-ai/AI-Papers-of-the-Week) with local models.'
+
+  adapterType: process
+  adapterConfig:
+    # Python from the environment that has paperclip_bridge installed (Agent-Reach venv).
+    command: 'C:\dev\Agent-Reach\.venv\Scripts\python.exe'
+    args: ['-m', 'paperclip_bridge']
+    cwd: 'C:\dev\Agent-Reach'
+    timeoutSec: 4200       # > RESEARCH_BRIDGE_TIMEOUT_S + RESEARCH_BRIDGE_GPU_WAIT_S
+    graceSec: 30
+    env:
+      # The research CLI; the bridge appends --in/--out. Quote paths that contain spaces.
+      RESEARCH_BRIDGE_CMD: '"C:\dev\research-toolkit\.venv\Scripts\python.exe" -m research_agent.cli'
+      RESEARCH_BRIDGE_CWD: 'C:\dev\research-toolkit'
+      RESEARCH_BRIDGE_TIMEOUT_S: '3600'
+      RESEARCH_BRIDGE_GPU_WAIT_S: '30'
+      RESEARCH_BRIDGE_GPU_LOCK_PATH: 'C:\ProgramData\paperclip_bridge\gpu.lock'
+      # Coder agent that receives hand-off tickets. Copy its id from the Paperclip UI.
+      # Leave '' to disable hand-offs; apply refuses to send the placeholder.
+      RESEARCH_BRIDGE_HANDOFF_AGENT_ID: '<coder-agent-uuid>'
+      # Read by research_agent/cli.py, passed through by the bridge.
+      RESEARCH_AGENT_GRAPH: 'research_agent.graph:graph'
+      RESEARCH_AGENT_RECURSION_LIMIT: '50'
+      RESEARCH_AGENT_AUTO_HANDOFF: '1'
+      PYTHONIOENCODING: 'utf-8'
+
+  runtimeConfig:
+    heartbeat:
+      enabled: true
+      intervalSec: 900         # retry path for tickets skipped while the GPU was busy
+      maxConcurrentRuns: 1     # Paperclip's default is 20; 1 = one GPU job for this agent
+      wakeOnDemand: true       # assigning a ticket wakes the agent immediately
+
+# Used by: python -m paperclip_bridge.setup_agent smoke --config paperclip.yaml
+smokeTest:
+  title: 'Paperclip bridge smoke test'
+  description: 'Find one recent AI paper on agent tool use and summarise it in three sentences.'
