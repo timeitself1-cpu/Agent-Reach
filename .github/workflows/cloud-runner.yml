@@ -1,0 +1,152 @@
+name: cloud-runner
+
+# Cloud takeover for Agent Reach: runs the full pipeline on a GitHub-hosted runner
+# (Ollama + llama3.1:8b on CPU) and carries the SQLite velocity history between runs
+# through the Actions cache.
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_state_id:
+        description: "Handoff session id (echoed into logs and the run summary)"
+        required: false
+        default: "manual"
+      entrypoint:
+        description: "Python module to run"
+        required: false
+        default: "agent_reach"
+      extra_args:
+        description: "Extra CLI args, e.g. --top 10 --sources hackernews github"
+        required: false
+        default: ""
+      no_llm:
+        description: "Skip Ollama and use deterministic clustering"
+        type: boolean
+        required: false
+        default: false
+  repository_dispatch:
+    types: [cloud-handoff]
+
+concurrency:
+  group: agent-reach-cloud-runner   # one run at a time so the SQLite history never forks
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  MODEL: llama3.1:8b
+  SESSION_STATE_ID: ${{ github.event.inputs.session_state_id || github.event.client_payload.session_state_id || 'dispatch' }}
+  ENTRYPOINT: ${{ github.event.inputs.entrypoint || github.event.client_payload.entrypoint || 'agent_reach' }}
+  EXTRA_ARGS: ${{ github.event.inputs.extra_args || github.event.client_payload.extra_args || '' }}
+  NO_LLM: ${{ github.event.inputs.no_llm || github.event.client_payload.no_llm || 'false' }}
+  AGENT_REACH_DB_PATH: state/agent_reach.db
+  AGENT_REACH_CONTACT_EMAIL: ${{ vars.AGENT_REACH_CONTACT_EMAIL || 'agent-reach@example.invalid' }}
+  # CPU-only runner: give the 8B model room per call and bound the LLM workload
+  AGENT_REACH_OLLAMA_TIMEOUT_S: "900"
+  AGENT_REACH_MAX_ITEMS_FOR_LLM: "80"
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Session banner
+        run: |
+          echo "Agent Reach cloud handoff"
+          echo "  session_state_id : $SESSION_STATE_ID"
+          echo "  entrypoint       : $ENTRYPOINT"
+          echo "  extra_args       : $EXTRA_ARGS"
+          echo "  no_llm           : $NO_LLM"
+          echo "  commit           : $GITHUB_SHA"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Restore velocity history (SQLite)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: agent-reach-db-${{ github.run_id }}
+          restore-keys: agent-reach-db-
+
+      - name: Restore Ollama model cache
+        if: env.NO_LLM != 'true'
+        id: model-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-models-llama3.1-8b
+
+      - name: Install and start Ollama
+        if: env.NO_LLM != 'true'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama 2>/dev/null || true
+          mkdir -p "$HOME/.ollama/models"
+          OLLAMA_MODELS="$HOME/.ollama/models" nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:11434/api/tags > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:11434/api/tags > /dev/null || { cat "$RUNNER_TEMP/ollama.log"; exit 1; }
+          OLLAMA_MODELS="$HOME/.ollama/models" ollama pull "$MODEL"
+          ollama list
+
+      - name: Save Ollama model cache
+        if: env.NO_LLM != 'true' && steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-models-llama3.1-8b
+
+      - name: Run Agent Reach
+        run: |
+          mkdir -p state reports
+          ARGS=(--json-out "reports/report-${GITHUB_RUN_ID}.json" --log-level INFO)
+          if [ "$NO_LLM" = "true" ]; then ARGS+=(--no-llm); fi
+          # shellcheck disable=SC2206
+          EXTRA=($EXTRA_ARGS)
+          set -o pipefail
+          python -m "$ENTRYPOINT" "${ARGS[@]}" "${EXTRA[@]}" 2> reports/pipeline.log | tee reports/report.txt
+
+      - name: Publish run summary
+        if: always()
+        run: |
+          {
+            echo "## Agent Reach cloud run"
+            echo ""
+            echo "- Session: \`$SESSION_STATE_ID\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo ""
+            echo '```text'
+            if [ -f reports/report.txt ]; then cat reports/report.txt; else echo "no report produced"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save velocity history (SQLite)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: agent-reach-db-${{ github.run_id }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-reach-report-${{ github.run_id }}
+          path: |
+            reports/
+            ${{ runner.temp }}/ollama.log
+          if-no-files-found: warn
+          retention-days: 14

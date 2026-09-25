@@ -1,0 +1,44 @@
+# --- secrets & local config (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+service-account*.json
+*.token
+
+# --- local runtime state ---
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+state/
+reports/
+
+# --- python caches / envs ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- packaged copies of this repo ---
+agent_reach.zip
