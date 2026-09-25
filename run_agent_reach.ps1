@@ -25,6 +25,7 @@ param(
     [ValidateSet("DEBUG", "INFO", "WARNING", "ERROR")]
     [string]$LogLevel = "INFO",
     [string]$Model = "llama3.1:8b",
+    [string]$EmbedModel = "nomic-embed-text",
     [string]$OllamaHost = "http://localhost:11434",
     [switch]$SkipOllamaInstall
 )
@@ -168,12 +169,27 @@ if (-not $NoLLM) {
         } else {
             Write-Ok "Model $Model available"
         }
+        # embedding model for density clustering (small, ~274 MB)
+        if (-not $NoLLM) {
+            $hasEmbed = ($names -contains $EmbedModel) -or ($names -contains "$EmbedModel`:latest") -or
+                        ($names | Where-Object { $_.Split(":")[0] -eq $EmbedModel.Split(":")[0] })
+            if (-not $hasEmbed) {
+                Write-Warn2 "Pulling $EmbedModel (one-time, ~274 MB)..."
+                $ollamaCmd = Get-Command ollama -ErrorAction SilentlyContinue
+                $ollamaPath = if ($ollamaCmd) { $ollamaCmd.Source } else { Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe" }
+                & $ollamaPath pull $EmbedModel
+                if ($LASTEXITCODE -ne 0) { Write-Warn2 "Embedding model pull failed - clustering falls back to lexical grouping." }
+            } else {
+                Write-Ok "Embedding model $EmbedModel available"
+            }
+        }
     }
 }
 
 # ------------------------------------------------------------------ 5. run
 $env:AGENT_REACH_OLLAMA_HOST = $OllamaHost
 $env:AGENT_REACH_OLLAMA_MODEL = $Model
+$env:AGENT_REACH_EMBED_MODEL = $EmbedModel
 $env:PYTHONIOENCODING = "utf-8"
 
 $runArgs = @("-m", "agent_reach", "--log-level", $LogLevel)

@@ -1,18 +1,22 @@
-"""Semantic clustering & entity resolution with a local Ollama model (llama3.1:8b).
+"""Stage 3: density clustering, LLM labelling and entity isolation (llama3.1:8b via Ollama).
 
 Flow
 ----
-1. Cheap lexical pre-grouping so related items land in the same LLM batch.
-2. Per-batch LLM call (20-25 items) with a strict JSON schema -> draft clusters + discards.
-3. Coherence enforcement: every cluster must be a connected graph of items that share
-   distinctive tokens or literally name the same entity. "Frankenstein" clusters that glue
-   unrelated stories together are split and the parts re-labelled by a second LLM pass.
-4. Cross-batch merge pass (LLM, verified against the same link graph) + deterministic merge.
-5. Validation: category guardrails, singleton policy, sanitised Title Case headlines and
-   two-sentence summaries.
+3a  Density grouping: embed title + enriched context (nomic-embed-text), cluster with HDBSCAN,
+    gate every member by cosine-to-centroid. Outliers are NOISE and are dropped, never forced
+    into a mixed bucket. (No embeddings available -> lexical union-find groups, same rule.)
+3b  LLM labelling: the model only NAMES groups (headline, category, entities, 2-sentence
+    summary, relevance); it never decides grouping. Groups whose signals cannot explain what
+    happened and why are flagged [INSUFFICIENT_DATA].
+3c  Entity isolation: each group must be a connected graph of items that share distinctive
+    tokens, name the same entity, or name entities that co-occur elsewhere in the run.
+    Mixed groups are split; split parts are re-labelled; unsupported strays are dropped.
+3d  Deterministic merge of groups that resolve to the same entities.
+3e  Finalise: drop [INSUFFICIENT_DATA] / filler summaries, relevance <= 3 and weak singletons;
+    category guardrails; Title Case headlines; exactly two clean sentences.
 
-If Ollama is unreachable or the model is missing, a deterministic lexical clusterer
-produces the report instead, so the pipeline never hard-fails.
+Every dropped item is recorded under a discard reason so stage accounting always balances.
+If Ollama is unreachable the same flow runs with heuristic labels, so the pipeline never hard-fails.
 """
 
 from __future__ import annotations
@@ -33,12 +37,11 @@ from agent_reach.config import Settings
 from agent_reach.models import (
     CategoryEnum,
     CleanedTrendItem,
-    LLMClusterResponse,
-    LLMMergeResponse,
     MacroCluster,
     SourceName,
     _coerce_ids,
 )
+from agent_reach.pipeline.density import EmbeddingUnavailable, density_cluster, embed_items
 from agent_reach.pipeline.cleaner import (
     STOPWORDS,
     category_votes,
@@ -109,86 +112,41 @@ CATEGORY_ALIASES: dict[str, CategoryEnum] = {
 }
 
 _WRITING_RULES = """HEADLINE rules: an authoritative, specific Title Case title of at most 10 words that names the concrete entity or event (e.g. "Packers Edge Falcons on Thursday Night Football", "OpenAI Releases GPT-6 With Native Agents"). Never write generic umbrella titles such as "Entertainment: Music and Film", "Tech: Tools and Innovations" or "Global Events and Diplomacy". Do not prefix the headline with the category name.
-SUMMARY rules: exactly TWO complete, grammatically correct sentences in active voice. Sentence 1 states what happened and who did it. Sentence 2 explains why it is trending or why it matters. Use ONLY facts present in the signals; never invent numbers, dates, scores or quotes. Never include URLs, @handles, hashtags, emoji, markdown or JSON fragments in the summary.
+SUMMARY rules: exactly TWO complete, grammatically correct sentences in active voice. Sentence 1 states what happened and who did it. Sentence 2 explains why it is drawing attention, using the provided context. Use ONLY facts present in the titles and context; never invent numbers, dates, scores or quotes. Never include URLs, @handles, hashtags, emoji, markdown or JSON fragments. Never write filler such as "this has significant implications", "worth monitoring", "no specific information is available" or "details are scarce".
 CATEGORY rules: exactly one of Sports, Entertainment, Tech, News, Internet Culture, Science & AI. Tech = software, hardware, developer tools, startups, tech companies, cybersecurity. Science & AI = AI models and research, scientific discoveries, space, research papers. Never label sports, celebrities, politics, pets or memes as Tech.
-PRIMARY_ENTITIES: 1-5 proper nouns (people, teams, organizations, products) that appear in the cluster's own signals.
+PRIMARY_ENTITIES: 1-5 proper nouns (people, teams, organizations, products) that appear in the group's own signals.
 RELEVANCE_SCORE: integer 1-10 for significance and breadth of interest (10 = major global story, 1 = trivial)."""
 
-CLUSTER_SYSTEM_PROMPT = f"""You are the semantic clustering engine of Agent Reach, a real-time trend-intelligence system.
-You receive a numbered list of trend signals collected in the last hours from social, search, news and developer platforms.
+INSUFFICIENT_FLAG = "[INSUFFICIENT_DATA]"
 
-GROUPING RULES (most important):
-1. STRICT TOPIC ISOLATION. Put two signals in the same cluster ONLY if they share an explicit, specific entity or event: the same person, team, game, company, product, paper or incident. Sharing a broad theme ("AI", "music", "politics", "sports", "technology") is NOT enough.
-2. DO NOT merge unrelated topics to reduce the number of clusters. Many small, precise clusters are correct; one big mixed cluster is wrong. Example of a FORBIDDEN cluster: "Taylor Swift music video" + "F-Droid 2.0 Android app store" + "Jordan Love". These are three different topics and must be three separate clusters (or discarded).
-3. DO resolve fragments of the same event: team names, player names, matchups and hashtags about the same game belong together (e.g. "Packers", "Falcons", "Jordan Love", "GB vs ATL" -> one cluster about the Packers vs. Falcons game).
-4. A cluster may contain a single signal when it is an important stand-alone story.
-5. DISCARD low-signal noise by putting its id in discarded_item_ids: personal anecdotes, pet/photo/meme posts, generic seasonal or filler hashtags, isolated stat lines, betting or box-score chatter, and anything too vague to be a trend.
-6. Every item id must appear exactly once: in one cluster's item_ids or in discarded_item_ids.
+CLUSTER_SYSTEM_PROMPT = f"""You are the labelling and summarisation engine of Agent Reach, a real-time trend-intelligence system.
+Signals have ALREADY been grouped by a density-based clustering step. Do NOT move signals between groups and do NOT merge groups.
+Each signal line reads: source | category hint | title | context. The context is text scraped from the linked page (page title, meta description, lead paragraph) when it was available.
 
-{_WRITING_RULES}
+For each numbered group write headline, category, primary_entities, summary and relevance_score describing ONLY that group's signals.
 
-Respond with JSON only."""
+INSUFFICIENT DATA RULE (strict): if the titles and context of a group do not let you state concretely what happened AND why it is drawing attention, set that group's summary to exactly {INSUFFICIENT_FLAG} and its relevance_score to 1. Do not guess and do not pad.
 
-MERGE_PROMPT = """You are deduplicating trend clusters produced from separate batches of the same data.
-Return groups of cluster ids that describe the SAME specific real-world story, event, game, product or person and must be merged.
-Only group clusters that share an explicit entity or event (for example two clusters about the same NFL game, or a model release and the company announcing that model). Never group clusters that merely share a category or a broad theme.
-For each group give a specific Title Case headline of at most 10 words. Clusters you do not mention stay unchanged. Respond with JSON only."""
-
-RELABEL_PROMPT = f"""You label trend clusters that have ALREADY been grouped by another process. Do NOT move signals between groups.
-For each numbered group write a headline, category, primary_entities, summary and relevance_score describing ONLY that group's signals.
-Then look at the unassigned signals. For each one, give the group_id of the group it clearly belongs to because it names the same specific person, team, organization, product or event as that group. If it does not clearly belong to any group, use group_id 0.
+If unassigned signals are listed, give for each one the group_id of the group it clearly belongs to because it names the same specific person, team, organization, product or event as that group; otherwise use group_id 0.
 
 {_WRITING_RULES}
 
 Respond with JSON only."""
+
+#: backwards-compatible alias (the labelling prompt is the only prompt now)
+RELABEL_PROMPT = CLUSTER_SYSTEM_PROMPT
+
+INSUFFICIENT_RX = re.compile(r"\[?\s*insufficient[\s_-]*data\s*\]?", re.IGNORECASE)
+FILLER_RX = re.compile(
+    r"\b(?:no (?:specific|further|additional|detailed) (?:information|details)|details (?:are|remain) (?:scarce|unclear|limited)|"
+    r"(?:not|in)sufficient (?:information|context|data|details)|not enough (?:information|context|details)|"
+    r"limited information|information is limited|unclear why|it is unclear (?:what|why)|cannot (?:be )?determine[d]?|"
+    r"no (?:clear|further) context|without (?:more|further|additional) (?:information|context))\b",
+    re.IGNORECASE,
+)
 
 
 # ======================================================================= schemas
-def _cluster_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "clusters": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "item_ids": {"type": "array", "items": {"type": "integer"}},
-                        "headline": {"type": "string"},
-                        "category": {"type": "string", "enum": CategoryEnum.values()},
-                        "primary_entities": {"type": "array", "items": {"type": "string"}},
-                        "summary": {"type": "string"},
-                        "relevance_score": {"type": "integer", "minimum": 1, "maximum": 10},
-                    },
-                    "required": ["item_ids", "headline", "category", "primary_entities", "summary", "relevance_score"],
-                },
-            },
-            "discarded_item_ids": {"type": "array", "items": {"type": "integer"}},
-        },
-        "required": ["clusters", "discarded_item_ids"],
-    }
-
-
-def _merge_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "groups": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "cluster_ids": {"type": "array", "items": {"type": "integer"}},
-                        "headline": {"type": "string"},
-                    },
-                    "required": ["cluster_ids", "headline"],
-                },
-            }
-        },
-        "required": ["groups"],
-    }
-
-
 def _relabel_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -464,6 +422,43 @@ class DraftCluster:
     needs_label: bool = False
 
 
+@dataclass
+class ClusterOutcome:
+    """Result of stage 3. Every input item is in exactly one cluster or one discard bucket."""
+
+    clusters: list[MacroCluster]
+    discards: dict[str, list[int]]
+    mode: str
+
+    @property
+    def discarded_count(self) -> int:
+        return sum(len(v) for v in self.discards.values())
+
+    def assert_partition(self, items: list[CleanedTrendItem]) -> None:
+        """Enforce the partition invariant; repairs (and logs) any violation instead of crashing a run."""
+        expected = {it.item_id for it in items}
+        seen: set[int] = set()
+        for c in self.clusters:
+            unique = [i for i in dict.fromkeys(c.member_item_ids) if i in expected and i not in seen]
+            if len(unique) != len(c.member_item_ids):
+                log.error("accounting: cluster %s had duplicate/foreign members; repaired", c.cluster_id)
+                by_id = {it.item_id: it for it in items}
+                c.member_item_ids = unique
+                c.raw_item_count = sum(by_id[i].raw_weight for i in unique) or 1
+            seen.update(c.member_item_ids)
+        for reason in list(self.discards):
+            kept = [i for i in dict.fromkeys(self.discards[reason]) if i in expected and i not in seen]
+            if len(kept) != len(self.discards[reason]):
+                log.error("accounting: discard bucket %s overlapped clusters/other buckets; repaired", reason)
+            self.discards[reason] = kept
+            seen.update(kept)
+        missing = expected - seen
+        if missing:
+            log.error("accounting: %d items were neither clustered nor discarded; recorded as unsupported_grouping", len(missing))
+            self.discards.setdefault("unsupported_grouping", []).extend(sorted(missing))
+        self.discards = {k: v for k, v in self.discards.items() if v}
+
+
 # ======================================================================= clusterer
 class SemanticClusterer:
     def __init__(self, settings: Settings) -> None:
@@ -585,99 +580,88 @@ class SemanticClusterer:
 
     # ....................................................... public entry point
     async def cluster(
-        self, items: list[CleanedTrendItem], corpus: list[CleanedTrendItem] | None = None
-    ) -> tuple[list[MacroCluster], int, str]:
-        """Returns (clusters, discarded_count, mode). ``corpus`` = all cleaned items (co-occurrence evidence)."""
-        if not items:
-            return [], 0, "empty"
-        ok, reason = await self.health_check()
-        if not ok:
-            log.warning("LLM unavailable (%s) -> deterministic heuristic clustering", reason)
-            clusters, discarded = self.heuristic_cluster(items)
-            return clusters, discarded, f"heuristic ({reason})"
-        try:
-            clusters, discarded = await self._llm_cluster(items, corpus)
-            return clusters, discarded, f"ollama:{self.settings.ollama_model}"
-        except ClusteringError as exc:
-            log.error("LLM clustering failed (%s) -> heuristic fallback", exc)
-            clusters, discarded = self.heuristic_cluster(items)
-            return clusters, discarded, "heuristic (LLM error)"
+        self,
+        items: list[CleanedTrendItem],
+        corpus: list[CleanedTrendItem] | None = None,
+        use_llm: bool = True,
+    ) -> ClusterOutcome:
+        """Group, label, isolate and validate ``items``.
 
-    # ....................................................... LLM path
-    async def _llm_cluster(
-        self, items: list[CleanedTrendItem], corpus: list[CleanedTrendItem] | None = None
-    ) -> tuple[list[MacroCluster], int]:
+        ``corpus`` = every cleaned item of the run (extra co-occurrence evidence for entity isolation).
+        ``use_llm=False`` skips Ollama entirely (no embeddings, heuristic labels).
+        """
+        if not items:
+            return ClusterOutcome(clusters=[], discards={}, mode="empty")
         by_id = {it.item_id: it for it in items}
         index = LinkIndex(items, corpus)
-        batches = self._make_batches(items)
-        drafts: list[DraftCluster] = []
-        discarded: set[int] = set()
-        assigned: set[int] = set()
-        failures = 0
-        for bi, batch in enumerate(batches, start=1):
-            local_to_global = {i: it.item_id for i, it in enumerate(batch, start=1)}
-            prompt = self._render_batch(batch)
-            log.info("LLM batch %d/%d (%d items)", bi, len(batches), len(batch))
-            try:
-                data = await self._chat_json(CLUSTER_SYSTEM_PROMPT, prompt, _cluster_schema(), f"cluster batch {bi}/{len(batches)}")
-                parsed = LLMClusterResponse.model_validate(data)
-            except (ClusteringError, ValueError) as exc:
-                failures += 1
-                log.warning("batch %d failed (%s); using heuristic grouping for it", bi, exc)
-                for group in self._lexical_groups(batch):
-                    drafts.append(self._heuristic_draft([by_id[i] for i in group]))
-                    assigned.update(group)
-                continue
-            for d in parsed.discarded_item_ids:
-                gid = local_to_global.get(d)
-                if gid is not None and gid not in assigned:
-                    discarded.add(gid)
-            for c in parsed.clusters:
-                gids = []
-                for lid in c.item_ids:
-                    gid = local_to_global.get(lid)
-                    if gid is not None and gid not in assigned:
-                        gids.append(gid)
-                        assigned.add(gid)
-                        discarded.discard(gid)
-                if not gids:
-                    continue
-                drafts.append(
-                    DraftCluster(
-                        item_ids=gids,
-                        headline=c.headline,
-                        category_raw=c.category,
-                        entities=[normalize_text(e) for e in c.primary_entities if normalize_text(e)][:6],
-                        summary=c.summary,
-                        relevance=c.relevance_score,
-                    )
-                )
-        if failures == len(batches):
-            raise ClusteringError("every LLM batch failed")
+        discards: dict[str, list[int]] = defaultdict(list)
 
-        # 1) split Frankenstein clusters, 2) re-home skipped items, 3) label anything re-grouped
-        drafts, orphans = self._enforce_coherence(drafts, index)
-        leftovers = [i for i in by_id if i not in assigned and i not in discarded]
-        orphans.extend(self._attach_leftovers(leftovers, drafts, index))
-        drafts, still_orphaned = await self._relabel(drafts, orphans, by_id)
-        discarded.update(still_orphaned)
+        llm_ok, reason = (await self.health_check()) if use_llm else (False, "--no-llm")
+        if use_llm and not llm_ok:
+            log.warning("LLM unavailable (%s) -> heuristic labels", reason)
 
-        if self.settings.llm_enable_merge_pass and len(batches) > 1 and len(drafts) > 1:
-            drafts = await self._llm_merge(drafts, index)
+        # ---- 3a density grouping
+        started = time.perf_counter()
+        groups, noise, method = await self._group(items, try_embeddings=use_llm)
+        if self.settings.outlier_policy == "keep_top":
+            keep = [i for i in noise if by_id[i].heuristic_score >= self.settings.singleton_keep_score]
+            groups.extend([[i] for i in keep])
+            noise = [i for i in noise if i not in set(keep)]
+        discards["density_noise"].extend(noise)
+        drafts = [DraftCluster(item_ids=list(g), headline="", category_raw="", needs_label=True) for g in groups]
+        log.info("stage 3a: %d groups, %d noise items via %s in %.1f s", len(drafts), len(noise), method, time.perf_counter() - started)
+
+        # ---- 3b label, 3c isolate (+ re-label split parts, offer strays back to them)
+        if llm_ok:
+            drafts, _ = await self._relabel(drafts, [], by_id)
+            drafts, orphans = self._enforce_coherence(drafts, index)
+            drafts, orphans = await self._relabel(drafts, orphans, by_id)
+            mode = f"ollama:{self.settings.ollama_model} + {method}"
+        else:
+            self._heuristic_labels(drafts, by_id)
+            drafts, orphans = self._enforce_coherence(drafts, index)
+            self._heuristic_labels(drafts, by_id)
+            mode = f"heuristic ({reason}) + {method}"
+        orphans = self._rehome_orphans(drafts, orphans, index)
+        discards["unsupported_grouping"].extend(orphans)
+
+        # ---- 3d merge, 3e finalise
         drafts = self._deterministic_merge(drafts, index)
-        clusters, dropped = self._finalize(drafts, by_id)
-        return clusters, len(discarded) + dropped
+        clusters, final_discards = self._finalize(drafts, by_id)
+        for r, ids in final_discards.items():
+            discards[r].extend(ids)
 
-    def _render_batch(self, batch: list[CleanedTrendItem]) -> str:
-        lines = ["Signals (id | source | hint | title | context):"]
-        for i, it in enumerate(batch, start=1):
-            lines.append(f"{i} | {self._render_item(it)}")
-        lines.append("")
-        lines.append(
-            f"Cluster these {len(batch)} signals. Keep unrelated topics in separate clusters. "
-            f"Every id 1..{len(batch)} must appear exactly once."
-        )
-        return "\n".join(lines)
+        outcome = ClusterOutcome(clusters=clusters, discards={k: v for k, v in discards.items() if v}, mode=mode)
+        outcome.assert_partition(items)
+        return outcome
+
+    async def _group(self, items: list[CleanedTrendItem], try_embeddings: bool) -> tuple[list[list[int]], list[int], str]:
+        if try_embeddings:
+            try:
+                client = self._get_client()
+                vectors = await embed_items(client, self.settings, items)
+                res = density_cluster(items, vectors, self.settings)
+                return res.groups, res.noise, res.method
+            except ImportError:
+                log.warning("ollama package missing -> lexical grouping")
+            except EmbeddingUnavailable as exc:
+                log.warning(
+                    "embeddings unavailable (%s) -> lexical grouping. Fix: ollama pull %s",
+                    str(exc)[:160], self.settings.embed_model,
+                )
+        groups = self._lexical_groups(items)
+        clusters = [g for g in groups if len(g) >= 2]
+        noise = [g[0] for g in groups if len(g) == 1]
+        return clusters, noise, "lexical (no embeddings)"
+
+    def _heuristic_labels(self, drafts: list[DraftCluster], by_id: dict[int, CleanedTrendItem]) -> None:
+        for d in drafts:
+            if d.needs_label or not d.headline:
+                h = self._heuristic_draft([by_id[i] for i in d.item_ids])
+                d.headline, d.category_raw, d.summary, d.entities, d.relevance = (
+                    h.headline, h.category_raw, h.summary, h.entities, h.relevance,
+                )
+                d.needs_label = False
 
     @staticmethod
     def _render_item(it: CleanedTrendItem) -> str:
@@ -686,35 +670,13 @@ class SemanticClusterer:
             src = f"reddit/r/{it.metadata['subreddit']}"
         hint = it.category_hint.value if it.category_hint else "-"
         ctx = ""
-        if it.source is SourceName.GOOGLE_TRENDS and it.metadata.get("news_titles"):
+        if it.context:
+            ctx = normalize_text(it.context)[:260]
+        elif it.source is SourceName.GOOGLE_TRENDS and it.metadata.get("news_titles"):
             ctx = normalize_text(" / ".join(it.metadata["news_titles"][:2]))[:160]
-        elif it.source in (SourceName.PRODUCTHUNT, SourceName.REDDIT) and it.description:
-            ctx = normalize_text(it.description)[:120]
-        return f"{src} | {hint} | {it.normalized_title[:200]}" + (f" | {ctx}" if ctx else "")
-
-    def _make_batches(self, items: list[CleanedTrendItem]) -> list[list[CleanedTrendItem]]:
-        """Bin-pack lexical pre-groups so related items share a batch and sit next to each other."""
-        size = self.batch_size
-        by_id = {it.item_id: it for it in items}
-        groups = sorted(
-            self._lexical_groups(items),
-            key=lambda g: (-len(g), -max(by_id[i].heuristic_score for i in g)),
-        )
-        batches: list[list[CleanedTrendItem]] = []
-        current: list[CleanedTrendItem] = []
-        for g in groups:
-            members = [by_id[i] for i in g]
-            if len(members) > size:  # oversized group: split it into its own batches
-                for k in range(0, len(members), size):
-                    batches.append(members[k : k + size])
-                continue
-            if len(current) + len(members) > size:
-                batches.append(current)
-                current = []
-            current.extend(members)
-        if current:
-            batches.append(current)
-        return batches
+        elif it.description:
+            ctx = normalize_text(it.description)[:160]
+        return f"{src} | {hint} | {it.normalized_title[:200]} | " + (ctx if ctx else "(no context)")
 
     # ....................................................... coherence
     def _enforce_coherence(
@@ -784,6 +746,26 @@ class SemanticClusterer:
         return out, orphans
 
     @staticmethod
+    def _rehome_orphans(drafts: list[DraftCluster], orphans: list[int], index: LinkIndex) -> list[int]:
+        """Attach an orphan to the ONE cluster whose (grounded) entities it literally names.
+
+        Entities were already grounded in each cluster's own items, so a literal match is real
+        evidence ('Falcons' -> the Packers vs. Falcons cluster). Ambiguous matches stay orphaned.
+        """
+        remaining: list[int] = []
+        attached = 0
+        for o in orphans:
+            homes = [d for d in drafts if any(index.mentions(o, e) for e in d.entities)]
+            if len(homes) == 1:
+                homes[0].item_ids.append(o)
+                attached += 1
+            else:
+                remaining.append(o)
+        if orphans:
+            log.info("stage 3c: %d/%d orphans re-homed by literal entity match", attached, len(orphans))
+        return remaining
+
+    @staticmethod
     def _ground_entities(entities: list[str], item_ids: list[int], index: LinkIndex) -> list[str]:
         """Drop entities that no member of the cluster actually names (leftovers of a mixed label)."""
         member_tokens: set[str] = set()
@@ -798,29 +780,6 @@ class SemanticClusterer:
             if etoks and etoks <= member_tokens:
                 kept.append(e)
         return kept
-
-    def _attach_leftovers(self, leftovers: list[int], drafts: list[DraftCluster], index: LinkIndex) -> list[int]:
-        """Items the model silently skipped join the draft they are most linked to, else become orphans.
-
-        Linking is member-to-member (never against a cluster's pooled vocabulary), so large
-        clusters cannot snowball by absorbing every leftover that shares a common word.
-        """
-        orphans: list[int] = []
-        attached = 0
-        for it in leftovers:
-            best, best_links = None, 0
-            for d in drafts:
-                links = sum(1 for m in d.item_ids if index.linked(it, m))
-                if links > best_links:
-                    best, best_links = d, links
-            if best is not None:
-                best.item_ids.append(it)
-                attached += 1
-            else:
-                orphans.append(it)
-        if leftovers:
-            log.info("leftover items: %d attached, %d orphaned", attached, len(orphans))
-        return orphans
 
     async def _relabel(
         self, drafts: list[DraftCluster], orphans: list[int], by_id: dict[int, CleanedTrendItem]
@@ -849,7 +808,7 @@ class SemanticClusterer:
             lines: list[str] = []
             for gi, d in enumerate(group_chunk, start=1):
                 lines.append(f"Group {gi}:")
-                for m in d.item_ids[:12]:
+                for m in d.item_ids[:10]:
                     lines.append(f"  - {self._render_item(by_id[m])}")
             if offered:
                 lines.append("")
@@ -858,9 +817,9 @@ class SemanticClusterer:
                     lines.append(f"{oi} | {self._render_item(by_id[o])}")
             lines.append("")
             lines.append(f"Label groups 1..{len(group_chunk)}" + (" and assign each unassigned signal." if offered else "."))
-            log.info("LLM relabel %d/%d (%d groups, %d unassigned)", ci, len(chunks), len(group_chunk), len(offered))
+            log.info("LLM label %d/%d (%d groups, %d items, %d unassigned)", ci, len(chunks), len(group_chunk), sum(len(d.item_ids) for d in group_chunk), len(offered))
             try:
-                data = await self._chat_json(RELABEL_PROMPT, "\n".join(lines), _relabel_schema(), f"relabel {ci}/{len(chunks)}")
+                data = await self._chat_json(CLUSTER_SYSTEM_PROMPT, "\n".join(lines), _relabel_schema(), f"label {ci}/{len(chunks)}")
                 parsed = _RelabelResponse.model_validate(data)
             except (ClusteringError, ValueError) as exc:
                 log.warning("relabel pass failed (%s); using heuristic labels", exc)
@@ -887,63 +846,9 @@ class SemanticClusterer:
         return drafts, remaining_orphans
 
     # ....................................................... merging
-    async def _llm_merge(self, drafts: list[DraftCluster], index: LinkIndex) -> list[DraftCluster]:
-        lines = ["Candidate clusters (id | category | headline | entities):"]
-        for i, d in enumerate(drafts, start=1):
-            ents = ", ".join(d.entities[:5]) or "-"
-            lines.append(f"{i} | {coerce_category(d.category_raw).value} | {normalize_text(d.headline)[:120]} | {ents}")
-        try:
-            data = await self._chat_json(MERGE_PROMPT, "\n".join(lines), _merge_schema(), "merge pass")
-            parsed = LLMMergeResponse.model_validate(data)
-        except (ClusteringError, ValueError) as exc:
-            log.warning("merge pass failed (%s); keeping batch clusters", exc)
-            return drafts
-        used: set[int] = set()
-        out: list[DraftCluster] = []
-        rejected = 0
-        for g in parsed.groups:
-            ids = [i for i in dict.fromkeys(g.cluster_ids) if 1 <= i <= len(drafts) and i not in used]
-            if len(ids) < 2:
-                continue
-            # accept only merges the evidence supports: split the proposed group into
-            # components of clusters that share an entity or have linked members
-            parent = {i: i for i in ids}
-
-            def find(x: int) -> int:
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-
-            for x in range(len(ids)):
-                for y in range(x + 1, len(ids)):
-                    if self._drafts_related(drafts[ids[x] - 1], drafts[ids[y] - 1], index):
-                        parent[find(ids[y])] = find(ids[x])
-            comps: dict[int, list[int]] = defaultdict(list)
-            for i in ids:
-                comps[find(i)].append(i)
-            for comp in comps.values():
-                if len(comp) < 2:
-                    rejected += 1
-                    continue
-                used.update(comp)
-                merged = self._merge_drafts([drafts[i - 1] for i in comp])
-                if len(comp) == len(ids) and g.headline and normalize_text(g.headline):
-                    merged.headline = g.headline
-                out.append(merged)
-        out.extend(d for i, d in enumerate(drafts, start=1) if i not in used)
-        if used or rejected:
-            log.info("merge pass: %d clusters merged, %d unsupported merge proposals rejected", len(used), rejected)
-        return out
-
     @staticmethod
     def _entity_keys(d: DraftCluster) -> set[str]:
         return {dedupe_key(e) for e in d.entities if len(dedupe_key(e)) >= 3}
-
-    def _drafts_related(self, a: DraftCluster, b: DraftCluster, index: LinkIndex) -> bool:
-        if self._entity_keys(a) & self._entity_keys(b):
-            return True
-        return any(index.linked(x, y) for x in a.item_ids for y in b.item_ids)
 
     def _merge_drafts(self, group: list[DraftCluster]) -> DraftCluster:
         group = sorted(group, key=lambda d: (len(d.item_ids), d.relevance), reverse=True)
@@ -1046,24 +951,34 @@ class SemanticClusterer:
             sentences.append(closing)
         return sanitize_summary(" ".join(sentences[:2]), entities)
 
+    @staticmethod
+    def is_insufficient(summary: str, headline: str = "") -> bool:
+        """True for the explicit [INSUFFICIENT_DATA] flag or placeholder/filler summaries."""
+        text = f"{headline} {summary}"
+        return bool(INSUFFICIENT_RX.search(text) or FILLER_RX.search(summary or "") or not normalize_text(summary or ""))
+
     def _finalize(
         self, drafts: list[DraftCluster], by_id: dict[int, CleanedTrendItem]
-    ) -> tuple[list[MacroCluster], int]:
+    ) -> tuple[list[MacroCluster], dict[str, list[int]]]:
         clusters: list[MacroCluster] = []
-        dropped = 0
+        discards: dict[str, list[int]] = defaultdict(list)
         s = self.settings
         for d in drafts:
             members = [by_id[i] for i in dict.fromkeys(d.item_ids) if i in by_id]
             if not members:
                 continue
-            if d.relevance < s.min_cluster_relevance:
-                dropped += len(members)
+            ids = [m.item_id for m in members]
+            if self.is_insufficient(d.summary, d.headline):
+                discards["insufficient_data"].extend(ids)
+                continue
+            if d.relevance < s.min_cluster_relevance:  # i.e. relevance <= 3 with the default floor of 4
+                discards["low_relevance"].extend(ids)
                 continue
             best_score = max(m.heuristic_score for m in members)
             multi_source = len({m.source for m in members}) > 1 or any(m.duplicate_count > 1 for m in members)
             if len(members) < s.min_cluster_items and not multi_source:
                 if not (best_score >= s.singleton_keep_score or d.relevance >= s.singleton_keep_relevance):
-                    dropped += len(members)
+                    discards["weak_singleton"].extend(ids)
                     continue
             fallback = Counter(
                 m.category_hint or m.inferred_category or CategoryEnum.NEWS for m in members
@@ -1093,7 +1008,7 @@ class SemanticClusterer:
                     summary=self._fix_summary(d.summary, members, headline, entities),
                     primary_entities=entities,
                     source_urls=urls[:10],
-                    raw_item_count=sum(m.duplicate_count for m in members),
+                    raw_item_count=sum(m.raw_weight for m in members),
                     sources=sorted({m.source.value for m in members}),
                     member_item_ids=[m.item_id for m in members],
                 )
@@ -1110,7 +1025,7 @@ class SemanticClusterer:
                 prev.relevance_score = max(prev.relevance_score, c.relevance_score)
             else:
                 unique[c.cluster_id] = c
-        return list(unique.values()), dropped
+        return list(unique.values()), dict(discards)
 
     # ....................................................... heuristic path
     def _lexical_groups(self, items: list[CleanedTrendItem]) -> list[list[int]]:
@@ -1172,12 +1087,18 @@ class SemanticClusterer:
         category = votes.most_common(1)[0][0] if votes else CategoryEnum.NEWS
         sources = sorted({m.source.value for m in members})
         subject = ", ".join(entities[:3]) or lead.normalized_title[:80]
-        n = sum(m.duplicate_count for m in members)
-        summary = (
-            f"{display_sources(sources)} {'are' if len(sources) > 1 else 'is'} surfacing "
-            f"{n} related signal{'s' if n != 1 else ''} about {subject}. "
-            f"The strongest signal reads \"{lead.normalized_title[:120]}\"."
-        )
+        n = sum(m.raw_weight for m in members)
+        with_ctx = next((m for m in members if m.context), None)
+        if with_ctx is not None:
+            # heuristic mode still reports facts: the lead sentence of the best scraped context
+            first = SENTENCE_SPLIT.split(sanitize_summary(with_ctx.context.split(" | ")[-1]))[0]
+            summary = (
+                f"{first.rstrip('.')}. "
+                f"{display_sources(sources)} {'are' if len(sources) > 1 else 'is'} carrying "
+                f"{n} related signal{'s' if n != 1 else ''} about {subject}."
+            )
+        else:
+            summary = INSUFFICIENT_FLAG  # nothing factual to say -> dropped in _finalize
         mean = sum(m.heuristic_score for m in members) / len(members)
         relevance = max(1, min(10, round(1 + 9 * (0.6 * mean + 0.4 * min(1.0, len(sources) / 3)))))
         return DraftCluster(
@@ -1188,9 +1109,3 @@ class SemanticClusterer:
             summary=summary,
             relevance=relevance,
         )
-
-    def heuristic_cluster(self, items: list[CleanedTrendItem]) -> tuple[list[MacroCluster], int]:
-        by_id = {it.item_id: it for it in items}
-        drafts = [self._heuristic_draft([by_id[i] for i in g]) for g in self._lexical_groups(items)]
-        clusters, dropped = self._finalize(drafts, by_id)
-        return clusters, dropped

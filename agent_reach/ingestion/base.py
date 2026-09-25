@@ -109,12 +109,26 @@ class BaseIngester(abc.ABC):
     use_bot_user_agent: bool = False
     #: Rotate among browser UAs per request. Off = always send DEFAULT_HEADERS' UA verbatim.
     rotate_user_agent: bool = True
+    #: Minimum gap between consecutive requests of this ingester (pacing for rate-limited hosts).
+    min_request_interval_s: float = 0.0
 
     def __init__(self, client: httpx.AsyncClient, settings: Settings, semaphore: asyncio.Semaphore) -> None:
         self.client = client
         self.settings = settings
         self.semaphore = semaphore
         self.log = logging.getLogger(f"agent_reach.ingest.{self.source.value}")
+        self._pace_lock = asyncio.Lock()
+        self._last_request_at = 0.0
+
+    async def _pace(self) -> None:
+        """Serialise request starts so they are at least ``min_request_interval_s`` apart."""
+        if self.min_request_interval_s <= 0:
+            return
+        async with self._pace_lock:
+            wait = self._last_request_at + self.min_request_interval_s - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_at = time.monotonic()
 
     # ------------------------------------------------------------ headers
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -141,17 +155,22 @@ class BaseIngester(abc.ABC):
         method: str = "GET",
         timeout: float | None = None,
         max_retries: int | None = None,
+        retry_statuses: frozenset[int] | set[int] | None = None,
     ) -> httpx.Response:
         """HTTP request with exponential backoff + full jitter; honours Retry-After.
 
         ``timeout`` / ``max_retries`` override the global settings for fail-fast endpoints.
+        ``retry_statuses`` extends the retryable set (e.g. 403 for hosts that block in bursts).
+        Every attempt is paced by ``min_request_interval_s``.
         """
+        retryable = RETRYABLE_STATUS | frozenset(retry_statuses or ())
         retries = self.settings.http_max_retries if max_retries is None else max(0, max_retries)
         attempts = retries + 1
         per_call_timeout = self.settings.http_timeout_s if timeout is None else timeout
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
+                await self._pace()
                 async with self.semaphore:
                     resp = await self.client.request(
                         method,
@@ -161,7 +180,7 @@ class BaseIngester(abc.ABC):
                         timeout=per_call_timeout,
                         follow_redirects=True,
                     )
-                if resp.status_code in RETRYABLE_STATUS:
+                if resp.status_code in retryable:
                     raise httpx.HTTPStatusError(
                         f"retryable status {resp.status_code}", request=resp.request, response=resp
                     )
@@ -170,7 +189,7 @@ class BaseIngester(abc.ABC):
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
                 status = exc.response.status_code
-                if status not in RETRYABLE_STATUS or attempt == attempts:
+                if status not in retryable or attempt == attempts:
                     break
                 delay = self._retry_after(exc.response) or self._backoff(attempt)
             except (httpx.TransportError, httpx.TimeoutException) as exc:
@@ -178,7 +197,7 @@ class BaseIngester(abc.ABC):
                 if attempt == attempts:
                     break
                 delay = self._backoff(attempt)
-            self.log.debug("retry %d/%d for %s in %.2fs (%s)", attempt, attempts - 1, url, delay, last_exc)
+            self.log.info("retry %d/%d for %s in %.1fs (%s)", attempt, attempts - 1, url.split("?")[0], delay, str(last_exc)[:80])
             await asyncio.sleep(delay)
         raise IngestionError(f"{url}: {type(last_exc).__name__}: {last_exc}") from last_exc
 

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import random
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
@@ -117,12 +116,17 @@ class XTrends24Ingester(BaseIngester):
 class RedditIngester(BaseIngester):
     """Top posts of the day per subreddit.
 
-    Uses the public JSON listing (score + comment counts, required by the noise filter) with a
-    fixed modern browser User-Agent; Reddit answers generic/bot UAs with ``403 Blocked``.
-    Each endpoint gets a short timeout and no retries so a blocked JSON call falls through to
-    RSS in ~3 s instead of burning the full backoff budget. After the first 403/429 on JSON the
-    remaining subreddits skip JSON entirely (circuit breaker). RSS items carry no engagement
-    metrics; they are tagged ``metrics_verified=False`` with their rank in the day's top listing.
+    Resilience model (Reddit blocks and rate-limits unauthenticated clients, hardest from
+    data-centre IPs such as CI runners):
+
+    * every request uses the fixed browser headers, a ``reddit_timeout_s`` (5 s) timeout and
+      exponential-backoff retries on 403/429/5xx/timeouts (``reddit_max_retries``), honouring
+      ``Retry-After``;
+    * ALL Reddit requests are paced at least ``reddit_request_spacing_s`` (2 s) apart;
+    * JSON listings carry score/comment counts; after the first definitive JSON 403/429 the
+      remaining subreddits go straight to RSS (circuit breaker);
+    * a ``reddit_budget_s`` wall-clock budget stops starting new subreddits, so Reddit can
+      never stall the ingestion stage. Failures return what was collected, never raise.
     """
 
     source = SourceName.REDDIT
@@ -132,46 +136,29 @@ class RedditIngester(BaseIngester):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._json_blocked = False
-        self._rss_lock = asyncio.Lock()
+        self.min_request_interval_s = self.settings.reddit_request_spacing_s
 
     async def fetch(self) -> list[RawTrendItem]:
         subs = self.settings.reddit_subreddits
         per_sub = max(5, self.settings.max_items_per_source // max(1, len(subs)))
-        gate = asyncio.Semaphore(self.settings.reddit_concurrency)
-
-        async def one(sub: str) -> tuple[list[RawTrendItem], str | None]:
-            async with gate:
-                await asyncio.sleep(random.uniform(0.1, 0.6))  # de-synchronise bursts
-                if not self._json_blocked:
-                    try:
-                        return await self._fetch_json(sub, per_sub), None
-                    except IngestionError as exc:
-                        if any(code in str(exc) for code in ("403", "429", "Blocked")):
-                            self._json_blocked = True
-                        self.log.info("r/%s JSON failed (%s); falling back to RSS", sub, str(exc)[:120])
-                try:
-                    if self._json_blocked:
-                        # blocked on JSON => also rate-limited on RSS: one request at a time, spaced out
-                        async with self._rss_lock:
-                            try:
-                                return await self._fetch_rss(sub, per_sub), None
-                            finally:
-                                await asyncio.sleep(self.settings.reddit_rss_spacing_s)
-                    return await self._fetch_rss(sub, per_sub), None
-                except IngestionError as exc:
-                    return [], f"r/{sub}: {exc}"
-
-        results = await asyncio.gather(*(one(sub) for sub in subs))
+        started = time.monotonic()
         items: list[RawTrendItem] = []
         errors: list[str] = []
-        for got, err in results:
+        skipped = 0
+        for sub in subs:  # sequential by design: pacing makes parallelism pointless and riskier
+            if time.monotonic() - started > self.settings.reddit_budget_s:
+                skipped += 1
+                continue
+            got, err = await self._fetch_sub(sub, per_sub)
             items.extend(got)
             if err:
                 errors.append(err)
+        if skipped:
+            errors.append(f"{skipped} subreddit(s) skipped: {self.settings.reddit_budget_s:.0f}s budget exhausted")
         if not items and errors:
             raise IngestionError("; ".join(errors)[:300])
         if errors:
-            self.log.info("%d/%d subreddits failed: %s", len(errors), len(subs), "; ".join(errors)[:200])
+            self.log.info("%d issue(s): %s", len(errors), "; ".join(errors)[:240])
         # verified (JSON) items first by score, then RSS items by rank
         items.sort(
             key=lambda it: (
@@ -183,12 +170,26 @@ class RedditIngester(BaseIngester):
         )
         return items
 
+    async def _fetch_sub(self, sub: str, per_sub: int) -> tuple[list[RawTrendItem], str | None]:
+        if not self._json_blocked:
+            try:
+                return await self._fetch_json(sub, per_sub), None
+            except IngestionError as exc:
+                if any(code in str(exc) for code in ("403", "429", "Blocked")):
+                    self._json_blocked = True
+                    self.log.info("JSON blocked (%s); remaining subreddits use RSS", str(exc)[:100])
+        try:
+            return await self._fetch_rss(sub, per_sub), None
+        except IngestionError as exc:
+            return [], f"r/{sub}: {str(exc)[:120]}"
+
     async def _fetch_json(self, sub: str, limit: int) -> list[RawTrendItem]:
         data = await self.get_json(
             f"https://www.reddit.com/r/{sub}/top.json",
             params={"t": "day", "limit": min(100, limit * 2), "raw_json": 1},
             timeout=self.settings.reddit_timeout_s,
-            max_retries=0,
+            max_retries=min(1, self.settings.reddit_max_retries),  # one retry, then RSS is cheaper
+            retry_statuses={403},
         )
         children = (data or {}).get("data", {}).get("children", [])
         hint = SUBREDDIT_CATEGORY.get(sub.lower())
@@ -228,7 +229,8 @@ class RedditIngester(BaseIngester):
             f"https://www.reddit.com/r/{sub}/top/.rss",
             params={"t": "day", "limit": limit},
             timeout=self.settings.reddit_timeout_s,
-            max_retries=0,
+            max_retries=self.settings.reddit_max_retries,
+            retry_statuses={403},
         )
         hint = SUBREDDIT_CATEGORY.get(sub.lower())
         out: list[RawTrendItem] = []
@@ -260,8 +262,19 @@ class TikTokCreativeCenterIngester(BaseIngester):
     source = SourceName.TIKTOK
     PAGE = "https://ads.tiktok.com/business/creativecenter/inspiration/popular/hashtag/pc/en"
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.min_request_interval_s = self.settings.tiktok_request_spacing_s
+
     async def fetch(self) -> list[RawTrendItem]:
-        html = await self.get_text(self.PAGE, params={"countryCode": self.settings.geo, "period": 7})
+        # 5 s timeout, backoff retries on 403/429/5xx, attempts paced 2 s apart
+        html = await self.get_text(
+            self.PAGE,
+            params={"countryCode": self.settings.geo, "period": 7},
+            timeout=self.settings.tiktok_timeout_s,
+            max_retries=self.settings.tiktok_max_retries,
+            retry_statuses={403},
+        )
         soup = BeautifulSoup(html, "html.parser")
         script = soup.find("script", id="__NEXT_DATA__")
         records: list[dict[str, Any]] = []

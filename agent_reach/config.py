@@ -32,7 +32,24 @@ class Settings(BaseSettings):
     ollama_keep_alive: str = "10m"
     llm_batch_size: int = Field(default=20, ge=5, le=25)  # >25 makes llama3.1:8b emit malformed JSON
     llm_max_retries: int = Field(default=2, ge=0, le=5)
-    llm_enable_merge_pass: bool = True
+
+    # ------------------------------------------------------ embeddings / density
+    embed_model: str = "nomic-embed-text"  # `ollama pull nomic-embed-text` (274 MB)
+    embed_prefix: str = "clustering: "  # nomic task prefix; set "" for other embedding models
+    embed_batch_size: int = Field(default=64, ge=1, le=512)
+    hdbscan_min_cluster_size: int = Field(default=2, ge=2, le=20)
+    hdbscan_min_samples: int = Field(default=1, ge=1, le=20)
+    hdbscan_selection: str = "leaf"  # "leaf" = many small tight clusters (entity isolation); "eom" = larger
+    density_member_min_cosine: float = Field(default=0.55, ge=0.0, le=1.0)  # member-to-centroid gate
+    density_fallback_cosine: float = Field(default=0.78, ge=0.0, le=1.0)  # threshold mode when sklearn missing
+    outlier_policy: str = "drop"  # "drop" = density outliers are noise; "keep_top" = keep outliers >= singleton_keep_score
+
+    # ------------------------------------------------------------ enrichment
+    enrich_enabled: bool = True
+    enrich_timeout_s: float = Field(default=6.0, ge=1.0, le=30.0)
+    enrich_concurrency: int = Field(default=8, ge=1, le=32)
+    enrich_max_bytes: int = Field(default=1_500_000, ge=50_000)
+    enrich_max_chars: int = Field(default=600, ge=100, le=4000)  # context kept per item (title+meta+paragraphs)
 
     # -------------------------------------------------------------- storage
     db_path: Path = Path("agent_reach.db")
@@ -75,9 +92,13 @@ class Settings(BaseSettings):
     reddit_min_comments: int = 5
     reddit_allow_unverified_rss: bool = False  # keep ALL RSS items regardless of rank
     reddit_rss_max_rank: int = Field(default=10, ge=0, le=100)  # RSS "top of day" ranks kept without metrics
-    reddit_timeout_s: float = 3.0  # per-endpoint timeout so blocked JSON fails fast to RSS
-    reddit_concurrency: int = Field(default=3, ge=1, le=6)
-    reddit_rss_spacing_s: float = Field(default=2.0, ge=0.0, le=10.0)  # gap between RSS calls once JSON is blocked
+    reddit_timeout_s: float = 5.0  # per-request timeout
+    reddit_request_spacing_s: float = Field(default=2.0, ge=0.0, le=10.0)  # min gap between ANY two Reddit requests
+    reddit_max_retries: int = Field(default=2, ge=0, le=5)  # backoff retries on 403/429/5xx/timeouts
+    reddit_budget_s: float = Field(default=30.0, ge=5.0)  # stop starting new subreddits after this long
+    tiktok_timeout_s: float = 5.0
+    tiktok_request_spacing_s: float = Field(default=2.0, ge=0.0, le=10.0)
+    tiktok_max_retries: int = Field(default=2, ge=0, le=5)
     hn_min_points: int = 10
     github_min_stars_today: int = 20
     min_title_chars: int = 3
@@ -104,6 +125,20 @@ class Settings(BaseSettings):
     def _weights_positive(cls, v: list[float]) -> list[float]:
         if any(w < 0 for w in v):
             raise ValueError("velocity_window_weights must be non-negative")
+        return v
+
+    @field_validator("hdbscan_selection")
+    @classmethod
+    def _selection(cls, v: str) -> str:
+        if v not in ("leaf", "eom"):
+            raise ValueError("hdbscan_selection must be 'leaf' or 'eom'")
+        return v
+
+    @field_validator("outlier_policy")
+    @classmethod
+    def _outliers(cls, v: str) -> str:
+        if v not in ("drop", "keep_top"):
+            raise ValueError("outlier_policy must be 'drop' or 'keep_top'")
         return v
 
     @field_validator("ollama_host")

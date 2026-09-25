@@ -21,12 +21,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
 from agent_reach.config import Settings, get_settings
 from agent_reach.ingestion import INGESTER_REGISTRY, build_ingesters
-from agent_reach.models import PipelineReport, RawTrendItem, SourceStat
+from agent_reach.models import (
+    DISCARD_STAGES,
+    CleanedTrendItem,
+    MacroCluster,
+    PipelineAccounting,
+    PipelineReport,
+    RawTrendItem,
+    SourceStat,
+)
 from agent_reach.pipeline.cleaner import TrendCleaner, normalize_text
 from agent_reach.pipeline.clusterer import SemanticClusterer
+from agent_reach.pipeline.enricher import ContentEnricher
 from agent_reach.pipeline.scorer import TrendScorer
 from agent_reach.storage.db import TrendDatabase
 
@@ -51,6 +61,52 @@ async def ingest_all(settings: Settings, only: list[str] | None) -> tuple[list[R
     return items, stats
 
 
+def build_accounting(
+    raw_items: list[RawTrendItem],
+    cleaned: list[CleanedTrendItem],
+    candidates: list[CleanedTrendItem],
+    breakdown: dict[str, int],
+    cluster_discards: dict[str, list[int]],
+    clusters: list[MacroCluster],
+) -> PipelineAccounting:
+    """Raw-item ledger across all stages. ingested == sum(discarded) + clustered must hold."""
+    weight = {c.item_id: c.raw_weight for c in cleaned}
+    candidate_ids = {c.item_id for c in candidates}
+    discarded: dict[str, int] = {r: n for r, n in breakdown.items() if r not in ("kept", "duplicates_merged") and n}
+    not_selected = sum(c.raw_weight for c in cleaned if c.item_id not in candidate_ids)
+    if not_selected:
+        discarded["not_selected_budget"] = not_selected
+    for reason, ids in cluster_discards.items():
+        n = sum(weight.get(i, 1) for i in ids)
+        if n:
+            discarded[reason] = discarded.get(reason, 0) + n
+    passed = sum(c.raw_weight for c in cleaned)
+    fields = dict(
+        ingested=len(raw_items),
+        passed_filters=passed,
+        clustering_candidates=passed - not_selected,
+        clustered=sum(c.raw_item_count for c in clusters),
+        discarded=discarded,
+        duplicates_folded=breakdown.get("duplicates_merged", 0),
+    )
+    try:
+        acct = PipelineAccounting(**fields)
+    except ValidationError as exc:  # never lose a report over a ledger bug - but make it loud
+        log.error("ACCOUNTING INVARIANT VIOLATED: %s", exc)
+        acct = PipelineAccounting.model_construct(**fields)
+    if not acct.balanced:
+        log.error(
+            "ACCOUNTING UNBALANCED: ingested %d != discarded %d + clustered %d (delta %d)",
+            acct.ingested, acct.discarded_total, acct.clustered, acct.unaccounted,
+        )
+    else:
+        log.info(
+            "accounting: %d ingested = %d discarded + %d in clusters (balanced)",
+            acct.ingested, acct.discarded_total, acct.clustered,
+        )
+    return acct
+
+
 async def run_once(settings: Settings, *, only: list[str] | None = None, use_llm: bool = True) -> PipelineReport:
     t0 = time.perf_counter()
     now = time.time()
@@ -69,40 +125,50 @@ async def run_once(settings: Settings, *, only: list[str] | None = None, use_llm
             ", ".join(f"{s.source}={s.item_count}{'' if s.ok else ' FAIL'}" for s in source_stats),
         )
 
-        # 2. clean ----------------------------------------------------------
+        # 2. clean + select ---------------------------------------------------
         cleaner = TrendCleaner(settings)
         cleaned, breakdown = cleaner.clean(raw_items)
-        llm_batch = cleaner.select_for_llm(cleaned)
-        log.info("stage 2/5 clean: %d kept, %d selected for clustering", len(cleaned), len(llm_batch))
+        candidates = cleaner.select_for_llm(cleaned)
+        log.info("stage 2/5 clean: %d kept, %d selected for clustering", len(cleaned), len(candidates))
+
+        # 2b. enrich candidates with page context (title, meta description, lead paragraphs)
+        enrichment: dict[str, int] = {}
+        if settings.enrich_enabled:  # needs HTTP only, not the LLM: heuristic mode benefits too
+            limits = httpx.Limits(max_connections=settings.enrich_concurrency * 2, max_keepalive_connections=10)
+            async with httpx.AsyncClient(limits=limits, timeout=settings.enrich_timeout_s) as client:
+                enrichment = await ContentEnricher(settings).enrich(candidates, client)
 
         # 3. cluster --------------------------------------------------------
         clusterer = SemanticClusterer(settings)
         stage = time.perf_counter()
-        log.info("stage 3/5 cluster: %s", "LLM" if use_llm else "heuristic")
-        if use_llm:
-            clusters, discarded, mode = await clusterer.cluster(llm_batch, corpus=cleaned)
-        else:
-            clusters, discarded = clusterer.heuristic_cluster(llm_batch)
-            mode = "heuristic (--no-llm)"
-
-        log.info("stage 3/5 cluster: %d clusters via %s in %.0f s", len(clusters), mode, time.perf_counter() - stage)
+        log.info("stage 3/5 cluster: %d candidates (%s)", len(candidates), "LLM" if use_llm else "heuristic, --no-llm")
+        outcome = await clusterer.cluster(candidates, corpus=cleaned, use_llm=use_llm)
+        clusters, mode = outcome.clusters, outcome.mode
+        log.info(
+            "stage 3/5 cluster: %d clusters via %s in %.0f s (discards: %s)",
+            len(clusters), mode, time.perf_counter() - stage,
+            ", ".join(f"{k}={len(v)}" for k, v in outcome.discards.items()) or "none",
+        )
 
         # 4. score ----------------------------------------------------------
         scorer = TrendScorer(settings, db)
         clusters, snapshots = await scorer.score(clusters, cleaned, run_id, now)
 
+        accounting = build_accounting(raw_items, cleaned, candidates, breakdown, outcome.discards, clusters)
         report = PipelineReport(
             run_id=run_id,
             execution_time=round(time.perf_counter() - t0, 2),
             ingested_count=len(raw_items),
-            filtered_count=len(cleaned),
+            filtered_count=accounting.passed_filters,
             cluster_count=len(clusters),
             macro_clusters=clusters,
             started_at=datetime.fromtimestamp(now, tz=timezone.utc),
             llm_mode=mode,
-            discarded_by_llm=discarded,
+            discarded_by_llm=sum(n for r, n in accounting.discarded.items() if DISCARD_STAGES.get(r) == "cluster"),
             source_stats=source_stats,
             filter_breakdown=breakdown,
+            accounting=accounting,
+            enrichment=enrichment,
         )
 
         log.info("stage 4/5 score: done")
@@ -136,10 +202,15 @@ def render_report(report: PipelineReport, settings: Settings, top_n: int | None 
         f" Run {report.run_id} | {report.started_at:%Y-%m-%d %H:%M UTC} | {report.execution_time:.1f}s | "
         f"Engine: {report.llm_mode}"
     )
-    out.append(
-        f" Pipeline: {report.ingested_count} ingested -> {report.filtered_count} passed filters -> "
-        f"{report.cluster_count} macro-clusters ({report.discarded_by_llm} items discarded at clustering)"
-    )
+    acct = report.accounting
+    if acct is not None:
+        out.append(
+            f" Pipeline: {acct.ingested} ingested -> {acct.passed_filters} passed filters -> "
+            f"{acct.clustering_candidates} clustering candidates -> {report.cluster_count} clusters "
+            f"covering {acct.clustered} items"
+        )
+    else:
+        out.append(f" Pipeline: {report.ingested_count} ingested -> {report.cluster_count} clusters")
     out.append(thin)
     out.append(" SOURCE HEALTH")
     for s in report.source_stats:
@@ -148,12 +219,34 @@ def render_report(report: PipelineReport, settings: Settings, top_n: int | None 
         if s.error:
             line += "  " + textwrap.shorten(s.error, max(20, W - len(line) - 4), placeholder="...")
         out.append(line)
-    noise = {k: v for k, v in sorted(report.filter_breakdown.items(), key=lambda kv: -kv[1]) if k != "kept"}
-    if noise:
+    if acct is not None:
         out.append(thin)
-        out.append(" NOISE FILTER")
+        status = "balanced" if acct.balanced else f"UNBALANCED by {acct.unaccounted}"
+        out.append(
+            f" ITEM ACCOUNTING  {acct.ingested} ingested = {acct.discarded_total} discarded + "
+            f"{acct.clustered} in clusters  [{status}]"
+        )
+        labels = {"clean": "filtered", "select": "budget", "cluster": "clustering", "other": "other"}
+        for stage_name, reasons in acct.by_stage().items():
+            text = ", ".join(f"{k}={v}" for k, v in reasons.items())
+            out.extend(
+                textwrap.wrap(
+                    f"{labels.get(stage_name, stage_name):<11}: {text}", W - 3,
+                    initial_indent="   ", subsequent_indent="   " + " " * 13,
+                )
+            )
+        if acct.duplicates_folded:
+            out.append(f"   {'dedup':<11}: {acct.duplicates_folded} duplicates folded into their representatives (not discards)")
+    if report.enrichment:
+        e = dict(report.enrichment)
+        with_ctx = e.pop("with_context", 0)
+        total = sum(e.values())
         out.extend(
-            textwrap.wrap(", ".join(f"{k}={v}" for k, v in noise.items()), W - 3, initial_indent="   ", subsequent_indent="   ")
+            textwrap.wrap(
+                f"{'enrichment':<11}: {with_ctx}/{total} candidates have page context ("
+                + ", ".join(f"{k}={v}" for k, v in sorted(e.items(), key=lambda kv: -kv[1])) + ")",
+                W - 3, initial_indent="   ", subsequent_indent="   " + " " * 13,
+            )
         )
     out.append(rule)
     w_rel = settings.rank_relevance_weight

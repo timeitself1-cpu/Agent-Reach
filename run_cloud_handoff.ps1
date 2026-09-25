@@ -29,6 +29,7 @@ param(
     [switch]$NoLLM,
     [switch]$Mirror,
     [switch]$NoWatch,
+    [switch]$PushOnly,       # commit + push + verify, but do not dispatch a cloud run
     [switch]$KeepWorkflow,   # don't overwrite .github/workflows/cloud-runner.yml with the embedded version
     [int]$StartTimeoutSec = 180
 )
@@ -91,6 +92,7 @@ permissions:
 
 env:
   MODEL: llama3.1:8b
+  EMBED_MODEL: nomic-embed-text
   SESSION_STATE_ID: ${{ github.event.inputs.session_state_id || github.event.client_payload.session_state_id || 'dispatch' }}
   ENTRYPOINT: ${{ github.event.inputs.entrypoint || github.event.client_payload.entrypoint || 'agent_reach' }}
   EXTRA_ARGS: ${{ github.event.inputs.extra_args || github.event.client_payload.extra_args || '' }}
@@ -99,7 +101,7 @@ env:
   AGENT_REACH_CONTACT_EMAIL: ${{ vars.AGENT_REACH_CONTACT_EMAIL || 'agent-reach@example.invalid' }}
   # CPU-only runner: give the 8B model room per call and bound the LLM workload
   AGENT_REACH_OLLAMA_TIMEOUT_S: "900"
-  AGENT_REACH_MAX_ITEMS_FOR_LLM: "80"
+  AGENT_REACH_MAX_ITEMS_FOR_LLM: "150"   # grouping is embedding-based; LLM only labels real clusters
   AGENT_REACH_LLM_MAX_RETRIES: "1"
   PYTHONIOENCODING: utf-8
   PYTHONUNBUFFERED: "1"
@@ -142,7 +144,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.ollama/models
-          key: ollama-models-llama3.1-8b
+          key: ollama-models-llama3.1-8b-nomic-embed-text
 
       - name: Install and start Ollama
         if: env.NO_LLM != 'true'
@@ -157,6 +159,7 @@ jobs:
           done
           curl -sf http://127.0.0.1:11434/api/tags > /dev/null || { cat "$RUNNER_TEMP/ollama.log"; exit 1; }
           OLLAMA_MODELS="$HOME/.ollama/models" ollama pull "$MODEL"
+          OLLAMA_MODELS="$HOME/.ollama/models" ollama pull "$EMBED_MODEL"
           ollama list
 
       - name: Save Ollama model cache
@@ -164,7 +167,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-models-llama3.1-8b
+          key: ollama-models-llama3.1-8b-nomic-embed-text
 
       - name: Run Agent Reach
         run: |
@@ -361,6 +364,17 @@ if ($localSha -ne $remoteSha) { Fail "Remote $Branch is $remoteSha but local HEA
 Ok "Remote verified: $Branch @ $($localSha.Substring(0,7)) on $ownerRepo"
 
 # ------------------------------------------------------------------ 4. dispatch
+if ($PushOnly) {
+    Write-Host ""
+    Write-Host "================ PUSH SUMMARY ================" -ForegroundColor Cyan
+    Write-Host ("  Repository : https://github.com/$ownerRepo")
+    Write-Host ("  Branch     : $Branch")
+    Write-Host ("  Commit     : $localSha")
+    Write-Host ("  Message    : " + ((& git log -1 --format=%s) -join ""))
+    Write-Host ("  Start a run: gh workflow run $Workflow --repo $ownerRepo   (or the Run workflow button)")
+    Write-Host "==============================================" -ForegroundColor Cyan
+    exit 0
+}
 Step "Dispatching $Workflow"
 $defaultBranch = (& gh repo view $ownerRepo --json defaultBranchRef --jq .defaultBranchRef.name).Trim()
 if ($defaultBranch -and $defaultBranch -ne $Branch) {
