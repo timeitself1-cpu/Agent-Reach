@@ -71,6 +71,8 @@ class Settings(BaseSettings):
         default_factory=lambda: ["popular", "news", "worldnews", "technology", "science", "sports", "movies"]
     )
     arxiv_categories: list[str] = Field(default_factory=lambda: ["cs.AI", "cs.LG", "cs.CL", "cs.CV"])
+    ai_papers_repo: str = "dair-ai/AI-Papers-of-the-Week"  # curated weekly list, years/<year>.md
+    ai_papers_branch: str = "main"
     max_items_per_source: int = Field(default=40, ge=5, le=200)
     enabled_sources: list[str] = Field(
         default_factory=lambda: [
@@ -81,6 +83,7 @@ class Settings(BaseSettings):
             "google_news",
             "wikipedia",
             "arxiv",
+            "ai_papers",
             "hackernews",
             "github",
             "producthunt",

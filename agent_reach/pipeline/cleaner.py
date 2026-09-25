@@ -167,6 +167,7 @@ SOURCE_WEIGHT: dict[SourceName, float] = {
     SourceName.GITHUB: 0.75,
     SourceName.PRODUCTHUNT: 0.65,
     SourceName.TIKTOK: 0.60,
+    SourceName.AI_PAPERS: 0.70,  # curated weekly picks: stronger signal than raw arXiv submissions
     SourceName.ARXIV: 0.55,
 }
 SOCIAL_SOURCES = frozenset({SourceName.REDDIT, SourceName.X_TRENDS24, SourceName.TIKTOK})
@@ -238,6 +239,7 @@ SOURCE_DISPLAY: dict[str, str] = {
     "google_news": "Google News",
     "wikipedia": "Wikipedia",
     "arxiv": "arXiv",
+    "ai_papers": "AI Papers of the Week",
     "hackernews": "Hacker News",
     "github": "GitHub",
     "producthunt": "Product Hunt",
@@ -495,7 +497,7 @@ class TrendCleaner:
             return "meme_or_photo", ""
         if src in SOCIAL_SOURCES and PET_RX.search(title):
             return "pet_post", ""
-        if src not in (SourceName.ARXIV, SourceName.GITHUB) and BOX_SCORE_RX.search(title):
+        if src not in (SourceName.ARXIV, SourceName.AI_PAPERS, SourceName.GITHUB) and BOX_SCORE_RX.search(title):
             return "box_score_or_betting", ""
         if src in SOCIAL_SOURCES and len(significant_tokens(title)) == 0 and not re.search(r"[A-Z]", title):
             return "no_signal_tokens", ""

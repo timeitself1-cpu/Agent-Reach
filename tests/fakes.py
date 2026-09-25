@@ -35,6 +35,23 @@ PAGES = {
 }
 
 
+PAPERS_MD = """# AI Papers of the Week - 2026
+
+## Top AI Papers of the Week (September 14 - September 20) - 2026
+| **Paper**  | **Links** |
+| ------------- | ------------- |
+| 1) **Agentic Reasoning Scaling** - A study of how agentic reasoning scales with model size and tool access. <br>● Detail: bigger tool budgets help more than bigger models. | [Paper](https://academy.dair.ai/papers/scaling-agentic-reasoning-in-large-language-models-2609.00001), [Tweet](https://x.com/dair_ai/status/1) |
+| 2) **GAUGE** - Amazon audits LLM user simulators against verifiable rewards across 25 agents. <br>● Satisfaction does not track success. | [Paper](https://example.org/gauge), [Tweet](https://x.com/dair_ai/status/2) |
+
+---
+
+## Top AI Papers of the Week (September 7 - September 13) - 2026
+| **Paper**  | **Links** |
+| ------------- | ------------- |
+| 1) **Older Paper** - Last week's pick. | [Paper](https://arxiv.org/abs/2609.00002) |
+"""
+
+
 def _rss(items: list[str]) -> bytes:
     return ('<?xml version="1.0"?><rss xmlns:ht="https://trends.google.com/trending/rss"><channel>' + "".join(items) + "</channel></rss>").encode()
 
@@ -68,6 +85,8 @@ def handler(req: httpx.Request) -> httpx.Response:
                "Lizzie_Borden": ("American woman", "Lizzie Borden was an American woman tried and acquitted of the 1892 axe murders of her father and stepmother.")}
         d, e = ext[path.rsplit("/", 1)[-1]]
         return httpx.Response(200, json={"description": d, "extract": e})
+    if h == "raw.githubusercontent.com" and "/AI-Papers-of-the-Week/" in path:
+        return httpx.Response(200, text=PAPERS_MD)
     if "arxiv" in h:
         return httpx.Response(200, content=b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/1</id><title>Scaling Agentic Reasoning in Large Language Models</title><summary>We study how agentic reasoning scales with model size and tool access across benchmarks.</summary><published>2026-09-24T00:00:00Z</published></entry></feed>')
     if "algolia" in h:

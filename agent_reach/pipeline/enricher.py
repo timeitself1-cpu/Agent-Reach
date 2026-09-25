@@ -7,6 +7,7 @@ paragraphs (trafilatura main-text extraction when installed, BeautifulSoup other
 
 Per-source strategy (no wasted requests):
     arxiv            abstract already in the feed               -> feed
+    ai_papers        curator's summary already in the feed      -> feed
     producthunt      tagline already in the feed (site is bot-walled) -> feed
     reddit           self-text, else the linked external article     -> feed / page
     google_trends    fetch the first linked news article, fall back to the news headlines
@@ -48,7 +49,7 @@ except Exception:  # noqa: BLE001 - any import problem => BeautifulSoup fallback
     trafilatura = None
 
 NO_PAGE_SOURCES = frozenset({SourceName.X_TRENDS24, SourceName.TIKTOK})
-FEED_CONTEXT_SOURCES = frozenset({SourceName.ARXIV, SourceName.PRODUCTHUNT})
+FEED_CONTEXT_SOURCES = frozenset({SourceName.ARXIV, SourceName.AI_PAPERS, SourceName.PRODUCTHUNT})
 BOILERPLATE_RX = re.compile(
     r"(cookie|subscribe|sign up|sign in|log in|newsletter|javascript|enable js|accept all|privacy policy|"
     r"all rights reserved|advertisement|skip to (main )?content|you have been blocked|access denied|"

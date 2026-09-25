@@ -935,7 +935,7 @@ class SemanticClusterer:
             votes.update(category_votes(f"{m.normalized_title} {m.description or ''}"))
         sources = {m.source for m in members}
 
-        if sources == {SourceName.ARXIV}:
+        if sources <= {SourceName.ARXIV, SourceName.AI_PAPERS}:
             return CategoryEnum.SCIENCE_AI
         if proposed in (CategoryEnum.TECH, CategoryEnum.SCIENCE_AI):
             tech_hint = hints[CategoryEnum.TECH] + hints[CategoryEnum.SCIENCE_AI]

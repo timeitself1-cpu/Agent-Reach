@@ -50,6 +50,7 @@ class SourceName(str, Enum):
     GOOGLE_NEWS = "google_news"
     WIKIPEDIA = "wikipedia"
     ARXIV = "arxiv"
+    AI_PAPERS = "ai_papers"
     HACKERNEWS = "hackernews"
     GITHUB = "github"
     PRODUCTHUNT = "producthunt"
