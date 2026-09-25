@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     ollama_keep_alive: str = "10m"
     llm_batch_size: int = Field(default=20, ge=5, le=25)  # >25 makes llama3.1:8b emit malformed JSON
     llm_max_retries: int = Field(default=2, ge=0, le=5)
+    llm_items_per_group: int = Field(default=4, ge=1, le=10)  # most central members shown per group when labelling
+    llm_context_chars: int = Field(default=160, ge=60, le=400)  # page-context excerpt per signal in LLM prompts
 
     # ------------------------------------------------------ embeddings / density
     embed_model: str = "nomic-embed-text"  # `ollama pull nomic-embed-text` (274 MB)

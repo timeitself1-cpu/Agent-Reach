@@ -312,6 +312,14 @@ def clean_entities(entities: list[str], limit: int = 6) -> list[str]:
     return out
 
 
+def _excerpt(text: str, limit: int) -> str:
+    """At most ``limit`` chars, cut at a word boundary."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:-") + "..."
+
+
 def _item_text(it: CleanedTrendItem) -> str:
     """Title plus the context that actually names entities (Google Trends news headlines etc.)."""
     parts = [it.normalized_title]
@@ -663,19 +671,22 @@ class SemanticClusterer:
                 )
                 d.needs_label = False
 
-    @staticmethod
-    def _render_item(it: CleanedTrendItem) -> str:
+    def _render_item(self, it: CleanedTrendItem) -> str:
         src = it.source.value
         if it.source is SourceName.REDDIT and it.metadata.get("subreddit"):
             src = f"reddit/r/{it.metadata['subreddit']}"
         hint = it.category_hint.value if it.category_hint else "-"
         ctx = ""
         if it.context:
-            ctx = normalize_text(it.context)[:260]
+            ctx = normalize_text(it.context)
+            title = normalize_text(it.normalized_title)
+            if title and ctx.lower().startswith(title.lower()):  # page title repeats the signal title
+                ctx = ctx[len(title):].lstrip(" .:-|")
         elif it.source is SourceName.GOOGLE_TRENDS and it.metadata.get("news_titles"):
-            ctx = normalize_text(" / ".join(it.metadata["news_titles"][:2]))[:160]
+            ctx = normalize_text(" / ".join(it.metadata["news_titles"][:2]))
         elif it.description:
-            ctx = normalize_text(it.description)[:160]
+            ctx = normalize_text(it.description)
+        ctx = _excerpt(ctx, self.settings.llm_context_chars)
         return f"{src} | {hint} | {it.normalized_title[:200]} | " + (ctx if ctx else "(no context)")
 
     # ....................................................... coherence
@@ -811,10 +822,15 @@ class SemanticClusterer:
             return drafts, orphans
 
         remaining_orphans = list(orphans)
+        per_group = self.settings.llm_items_per_group
+
+        def shown_count(ds: list[DraftCluster]) -> int:
+            return sum(min(len(d.item_ids), per_group) for d in ds)
+
         chunk: list[DraftCluster] = []
         chunks: list[list[DraftCluster]] = []
         for d in sorted(pending, key=lambda x: -len(x.item_ids)):
-            if chunk and sum(len(c.item_ids) for c in chunk) + len(d.item_ids) > self.batch_size:
+            if chunk and shown_count(chunk + [d]) > self.batch_size:
                 chunks.append(chunk)
                 chunk = []
             chunk.append(d)
@@ -822,13 +838,17 @@ class SemanticClusterer:
             chunks.append(chunk)
 
         for ci, group_chunk in enumerate(chunks, start=1):
-            room = max(0, self.batch_size - sum(len(d.item_ids) for d in group_chunk))
+            room = max(0, self.batch_size - shown_count(group_chunk))
             offered = remaining_orphans[: max(room, 5)]
             lines: list[str] = []
             for gi, d in enumerate(group_chunk, start=1):
                 lines.append(f"Group {gi}:")
-                for m in d.item_ids[:10]:
+                # members arrive most central first (density order); the rest add tokens, not facts
+                shown = d.item_ids[:per_group]
+                for m in shown:
                     lines.append(f"  - {self._render_item(by_id[m])}")
+                if len(d.item_ids) > len(shown):
+                    lines.append(f"  (+{len(d.item_ids) - len(shown)} more similar signals)")
             if offered:
                 lines.append("")
                 lines.append("Unassigned signals (id | source | hint | title | context):")
@@ -836,7 +856,10 @@ class SemanticClusterer:
                     lines.append(f"{oi} | {self._render_item(by_id[o])}")
             lines.append("")
             lines.append(f"Label groups 1..{len(group_chunk)}" + (" and assign each unassigned signal." if offered else "."))
-            log.info("LLM label %d/%d (%d groups, %d items, %d unassigned)", ci, len(chunks), len(group_chunk), sum(len(d.item_ids) for d in group_chunk), len(offered))
+            log.info(
+                "LLM label %d/%d (%d groups, %d items, %d shown, %d unassigned)",
+                ci, len(chunks), len(group_chunk), sum(len(d.item_ids) for d in group_chunk), shown_count(group_chunk), len(offered),
+            )
             try:
                 data = await self._chat_json(CLUSTER_SYSTEM_PROMPT, "\n".join(lines), _relabel_schema(), f"label {ci}/{len(chunks)}")
                 parsed = _RelabelResponse.model_validate(data)
