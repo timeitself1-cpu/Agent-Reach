@@ -27,16 +27,26 @@ param(
     [string]$Model = "llama3.1:8b",
     [string]$EmbedModel = "nomic-embed-text",
     [string]$OllamaHost = "http://localhost:11434",
-    [switch]$SkipOllamaInstall
+    [switch]$SkipOllamaInstall,
+    [switch]$NoPause          # never wait for Enter on errors (for scheduled/automated runs)
 )
 
-$ErrorActionPreference = "Stop"
+# "Continue", not "Stop": Windows PowerShell 5.1 can turn native-command stderr (pip, ollama)
+# into terminating errors. Every native call checks $LASTEXITCODE; key cmdlets use -ErrorAction Stop.
+$ErrorActionPreference = "Continue"
 $ProgressPreference = "SilentlyContinue"
 
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "    $msg" -ForegroundColor Green }
 function Write-Warn2([string]$msg){ Write-Host "    $msg" -ForegroundColor Yellow }
-function Fail([string]$msg)       { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+function Wait-IfInteractive {
+    # keep a double-clicked / "Run with PowerShell" window open so the error can be read
+    if (-not $NoPause -and [Environment]::UserInteractive -and $Host.Name -eq "ConsoleHost") {
+        Write-Host ""
+        Read-Host "Press Enter to close" | Out-Null
+    }
+}
+function Fail([string]$msg)       { Write-Host "ERROR: $msg" -ForegroundColor Red; Wait-IfInteractive; exit 1 }
 
 # ------------------------------------------------------------------ 1. locate project
 Write-Step "Locating Agent Reach project"
@@ -64,11 +74,11 @@ if (-not $root) {
     }
     $dest = Split-Path $zip -Parent
     Write-Ok "Extracting $zip -> $dest"
-    Expand-Archive -Path $zip -DestinationPath $dest -Force
+    Expand-Archive -Path $zip -DestinationPath $dest -Force -ErrorAction Stop
     $root = Find-ProjectRoot $dest
     if (-not $root) { Fail "Extracted archive but could not find requirements.txt + agent_reach\main.py" }
 }
-Set-Location $root
+Set-Location -LiteralPath $root -ErrorAction Stop
 Write-Ok "Project: $root"
 
 # ------------------------------------------------------------------ 2. python
@@ -103,18 +113,27 @@ $reqHash = (Get-FileHash (Join-Path $root "requirements.txt") -Algorithm SHA256)
 $stamp = Join-Path $root ".venv\.requirements.sha256"
 $installed = if (Test-Path $stamp) { (Get-Content $stamp -Raw).Trim() } else { "" }
 if ($installed -ne $reqHash) {
-    Write-Ok "Installing requirements..."
-    & $venvPy -m pip install --upgrade pip --quiet --disable-pip-version-check
-    & $venvPy -m pip install -r requirements.txt --quiet --disable-pip-version-check
-    if ($LASTEXITCODE -ne 0) { Fail "pip install failed" }
-    Set-Content -Path $stamp -Value $reqHash -NoNewline
+    Write-Ok "Installing requirements (log: .venv\pip-install.log)..."
+    & $venvPy -m pip install --upgrade pip --disable-pip-version-check 2>&1 | ForEach-Object { "$_" } | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warn2 "pip self-upgrade failed (continuing with the current pip)" }
+    $pipLog = Join-Path $root ".venv\pip-install.log"
+    & $venvPy -m pip install -r requirements.txt --disable-pip-version-check 2>&1 |
+        ForEach-Object { "$_" } | Tee-Object -FilePath $pipLog | Where-Object { $_ -match "^(Collecting|Successfully|ERROR|error:)" } |
+        ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "---- last lines of $pipLog ----" -ForegroundColor Yellow
+        Get-Content $pipLog -Tail 25 | ForEach-Object { Write-Host "    $_" }
+        Fail "pip install failed (full log: $pipLog)"
+    }
+    Set-Content -Path $stamp -Value $reqHash -NoNewline -ErrorAction Stop
     Write-Ok "Dependencies installed"
 } else {
     Write-Ok "Dependencies up to date"
 }
 
 if (-not (Test-Path (Join-Path $root ".env")) -and (Test-Path (Join-Path $root ".env.example"))) {
-    Copy-Item (Join-Path $root ".env.example") (Join-Path $root ".env")
+    Copy-Item (Join-Path $root ".env.example") (Join-Path $root ".env") -ErrorAction Stop
     Write-Ok "Created .env from .env.example (edit AGENT_REACH_CONTACT_EMAIL when convenient)"
 }
 
@@ -202,4 +221,14 @@ if ($JsonOut) { $runArgs += @("--json-out", $JsonOut) }
 Write-Step ("Running: python " + ($runArgs -join " "))
 Write-Host ""
 & $venvPy @runArgs
-exit $LASTEXITCODE
+$code = $LASTEXITCODE
+if ($code -ne 0) {
+    Write-Host ""
+    Write-Host "Agent Reach exited with code $code - see the messages above." -ForegroundColor Red
+    Wait-IfInteractive
+} elseif (-not $Loop) {
+    Write-Host ""
+    Write-Host "Run complete." -ForegroundColor Green
+    Wait-IfInteractive
+}
+exit $code
