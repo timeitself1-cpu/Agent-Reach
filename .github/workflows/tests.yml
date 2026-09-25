@@ -40,7 +40,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
 
       - name: pyflakes
-        run: python -m pyflakes agent_reach tests
+        run: python -m pyflakes agent_reach paperclip_bridge tests
 
       - name: pytest
         run: python -m pytest
