@@ -296,6 +296,20 @@ class TrendDatabase:
         with self._lock:
             return int(self._conn.execute("SELECT COUNT(*) FROM runs WHERE finished_at IS NOT NULL").fetchone()[0])
 
+    def recent_runs(self, limit: int = 6) -> list[sqlite3.Row]:
+        """Finished runs, newest first."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM runs WHERE finished_at IS NOT NULL ORDER BY started_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+
+    def clusters_for_run(self, run_id: str) -> list[sqlite3.Row]:
+        """A run's reported clusters, best first."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM clusters WHERE run_id=? ORDER BY combined_score DESC", (run_id,)
+            ).fetchall()
+
     def cluster_history(self, cluster_id: str, limit: int = 20) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(
