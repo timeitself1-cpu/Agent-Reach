@@ -4,6 +4,7 @@
     python -m agent_reach.main --loop --interval 30
     python -m agent_reach.main --sources hackernews github --no-llm
     python -m agent_reach.main --json-out report.json
+    python -m agent_reach chat                    # chat with Reach about the latest report
 """
 
 from __future__ import annotations
@@ -348,6 +349,10 @@ async def amain(argv: list[str] | None = None) -> int:
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["chat"]:  # `python -m agent_reach chat ...`: the local chat page
+        from agent_reach.chat.server import main as chat_main
+
+        sys.exit(chat_main(sys.argv[2:]))
     try:
         sys.exit(asyncio.run(amain()))
     except KeyboardInterrupt:

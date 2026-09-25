@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reach</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5f6b7a; --line: #e3e7ec;
+    --accent: #2f6fdb; --accent-ink: #ffffff; --chip: #eef2f7; --user: #2f6fdb; --user-ink: #ffffff;
+    --bot: #f1f3f6; --warn: #b54708; --rise: #1a7f37; --fall: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --panel: #161a20; --ink: #e6e9ee; --muted: #93a0b0; --line: #262c35;
+      --accent: #5b8def; --accent-ink: #0f1216; --chip: #1f252e; --user: #3a6fd8; --user-ink: #ffffff;
+      --bot: #1d232b; --warn: #f5a524; --rise: #4ac26b; --fall: #f47067;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  .origin { color: var(--muted); font-size: 13px; flex: 1; min-width: 200px; }
+  .origin a { color: var(--accent); }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:disabled { opacity: .55; cursor: default; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(320px, 44%) 1fr; min-height: 0; }
+  #trends { overflow-y: auto; padding: 14px 16px; border-right: 1px solid var(--line); }
+  #chat { display: flex; flex-direction: column; min-height: 0; }
+  .notes { color: var(--warn); font-size: 13px; margin: 0 0 10px; }
+  .health { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+  .health .bad { color: var(--fall); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .card.flash { outline: 2px solid var(--accent); }
+  .card .top { display: flex; gap: 8px; align-items: baseline; }
+  .rank { color: var(--muted); font-weight: 600; min-width: 26px; }
+  .headline { font-weight: 600; flex: 1; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; font-size: 12px; }
+  .chip { background: var(--chip); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+  .chip.RISING, .chip.NEW { color: var(--rise); } .chip.COOLING { color: var(--fall); }
+  .summary { margin: 4px 0 6px; font-size: 14px; }
+  .links { font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+  .links a { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ask { margin-top: 8px; font-size: 13px; padding: 4px 10px; }
+  #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 85%; padding: 9px 12px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); color: var(--user-ink); border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 4px; }
+  .msg.bot a { color: var(--accent); }
+  .msg.error { align-self: flex-start; color: var(--fall); background: transparent; border: 1px solid var(--fall); }
+  .ref { color: var(--accent); cursor: pointer; font-weight: 600; }
+  .status { align-self: flex-start; color: var(--muted); font-size: 13px; font-style: italic; }
+  .welcome { color: var(--muted); font-size: 14px; }
+  #suggest { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 16px 8px; }
+  #suggest button { font-size: 13px; padding: 4px 10px; border-radius: 999px; }
+  form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel); }
+  textarea { flex: 1; resize: none; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; height: 44px; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 45% 55%; }
+    #trends { border-right: 0; border-bottom: 1px solid var(--line); }
+    .msg { max-width: 95%; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Reach</h1>
+  <div class="origin" id="origin">Loading the latest report...</div>
+  <button id="refresh" title="Look for a newer local or cloud report">Refresh</button>
+</header>
+<main>
+  <section id="trends" aria-label="Trends"></section>
+  <section id="chat" aria-label="Chat">
+    <div id="messages" aria-live="polite">
+      <div class="welcome">Ask Reach about the trends on the left. Name a trend (like "#2") and Reach reads its sources before answering.</div>
+    </div>
+    <div id="suggest"></div>
+    <form id="form">
+      <textarea id="input" placeholder="Ask about the trends..." aria-label="Message"></textarea>
+      <button class="primary" id="send" type="submit">Send</button>
+    </form>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const chatLog = [];
+let busy = false;
+let trendCount = 0;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function ago(hours) {
+  if (hours < 1) return Math.round(hours * 60) + " min ago";
+  if (hours < 48) return hours.toFixed(1) + " h ago";
+  return Math.round(hours / 24) + " days ago";
+}
+
+function renderSnapshot(s) {
+  const origin = $("origin");
+  origin.textContent = "";
+  const trends = $("trends");
+  trends.textContent = "";
+  trendCount = s.trends.length;
+  if (!s.available) {
+    origin.textContent = "No report loaded - chat model " + s.model;
+  } else {
+    origin.append(s.origin_label + " · " + ago(s.age_hours) + " · " + s.trends.length + " trends · chat model " + s.model + " ");
+    if (s.origin_url) {
+      const a = el("a", "", "open run");
+      a.href = s.origin_url; a.target = "_blank"; a.rel = "noopener";
+      origin.append(a);
+    }
+  }
+  for (const n of s.notes || []) trends.append(el("p", "notes", n));
+  if (s.source_stats && s.source_stats.length) {
+    const h = el("p", "health");
+    h.append("Sources: ");
+    s.source_stats.forEach((st, i) => {
+      const span = el("span", st.ok ? "" : "bad", st.source + (st.ok ? " " + st.item_count : " failed"));
+      if (!st.ok && st.error) span.title = st.error;
+      h.append(span);
+      if (i < s.source_stats.length - 1) h.append(" · ");
+    });
+    trends.append(h);
+  }
+  if (s.available && !s.trends.length) trends.append(el("p", "notes", "This run produced no trends."));
+  for (const t of s.trends) {
+    const card = el("article", "card");
+    card.id = "trend-" + t.rank;
+    const top = el("div", "top");
+    top.append(el("span", "rank", "#" + t.rank), el("span", "headline", t.headline));
+    const meta = el("div", "meta");
+    meta.append(
+      el("span", "chip", t.category),
+      el("span", "chip", "relevance " + t.relevance + "/10"),
+      el("span", "chip " + t.momentum, "velocity " + Math.round(t.velocity) + " " + t.momentum),
+      el("span", "chip", t.items + " items · " + t.sources.join(", "))
+    );
+    card.append(top, meta, el("p", "summary", t.summary));
+    if (t.urls.length) {
+      const links = el("div", "links");
+      for (const u of t.urls.slice(0, 3)) {
+        const a = el("a", "", u);
+        a.href = u; a.target = "_blank"; a.rel = "noopener noreferrer";
+        links.append(a);
+      }
+      card.append(links);
+    }
+    const ask = el("button", "ask", "Ask about this");
+    ask.addEventListener("click", () => send("Tell me more about #" + t.rank + ": what happened and why is it trending?"));
+    card.append(ask);
+    trends.append(card);
+  }
+  const sug = $("suggest");
+  sug.textContent = "";
+  if (s.available && s.trends.length) {
+    const qs = ["What are the biggest stories right now?", "What's rising fastest?", "Summarise #1 in three bullets"];
+    if (s.trends.length > 1) qs.push("How are #1 and #2 related?");
+    for (const q of qs) {
+      const b = el("button", "", q);
+      b.addEventListener("click", () => send(q));
+      sug.append(b);
+    }
+  }
+}
+
+async function loadSnapshot(method) {
+  const btn = $("refresh");
+  btn.disabled = true;
+  try {
+    const opts = method === "POST" ? { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" } : {};
+    const r = await fetch(method === "POST" ? "/api/refresh" : "/api/snapshot", opts);
+    renderSnapshot(await r.json());
+  } catch (e) {
+    $("origin").textContent = "Could not reach the Reach server: " + e;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function flashTrend(n) {
+  const card = $("trend-" + n);
+  if (!card) return;
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  card.classList.add("flash");
+  setTimeout(() => card.classList.remove("flash"), 1500);
+}
+
+// Safe rendering: text nodes only; URLs become links, "#n" becomes a jump to the card, **x** is bold.
+function renderRich(target, text) {
+  target.textContent = "";
+  const rx = /(https?:\/\/[^\s)\]>"']+)|#(\d{1,2})\b|\*\*([^*]+)\*\*/g;
+  let last = 0, m;
+  while ((m = rx.exec(text)) !== null) {
+    if (m.index > last) target.append(text.slice(last, m.index));
+    if (m[1]) {
+      const url = m[1].replace(/[.,;:]+$/, "");
+      const a = el("a", "", url);
+      a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      target.append(a);
+      if (url.length < m[1].length) target.append(m[1].slice(url.length));
+    } else if (m[2]) {
+      const n = parseInt(m[2], 10);
+      if (n >= 1 && n <= trendCount) {
+        const ref = el("span", "ref", "#" + n);
+        ref.addEventListener("click", () => flashTrend(n));
+        target.append(ref);
+      } else {
+        target.append(m[0]);
+      }
+    } else {
+      target.append(el("strong", "", m[3]));
+    }
+    last = rx.lastIndex;
+  }
+  if (last < text.length) target.append(text.slice(last));
+}
+
+function scrollDown() { const box = $("messages"); box.scrollTop = box.scrollHeight; }
+
+async function send(text) {
+  text = (text || "").trim();
+  if (!text || busy) return;
+  busy = true;
+  $("send").disabled = true;
+  $("input").value = "";
+  const box = $("messages");
+  box.append(el("div", "msg user", text));
+  chatLog.push({ role: "user", content: text });
+  const status = el("div", "status", "Sending...");
+  box.append(status);
+  scrollDown();
+  let bubble = null, reply = "";
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: chatLog })
+    });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === "status") {
+          status.textContent = ev.text;
+        } else if (ev.type === "token") {
+          if (!bubble) { status.remove(); bubble = el("div", "msg bot"); box.append(bubble); }
+          reply += ev.text;
+          bubble.textContent = reply;
+        } else if (ev.type === "error") {
+          status.remove();
+          box.append(el("div", "msg error", ev.text));
+        }
+        scrollDown();
+      }
+    }
+  } catch (e) {
+    status.remove();
+    box.append(el("div", "msg error", "Connection problem: " + e));
+  } finally {
+    if (status.isConnected) status.remove();
+    if (bubble) { renderRich(bubble, reply); chatLog.push({ role: "assistant", content: reply }); }
+    else chatLog.pop();  // keep chatLog aligned: drop the unanswered question
+    busy = false;
+    $("send").disabled = false;
+    $("input").focus();
+    scrollDown();
+  }
+}
+
+$("form").addEventListener("submit", (e) => { e.preventDefault(); send($("input").value); });
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send($("input").value); }
+});
+$("refresh").addEventListener("click", () => loadSnapshot("POST"));
+loadSnapshot("GET");
+</script>
+</body>
+</html>

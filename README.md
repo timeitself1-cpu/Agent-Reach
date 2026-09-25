@@ -22,6 +22,21 @@ python -m agent_reach --no-llm                          # deterministic clusteri
 python -m agent_reach --json-out reports/latest.json --log-level DEBUG
 ```
 
+## Chat with Reach
+
+```bash
+python -m agent_reach chat                  # opens http://127.0.0.1:8765 in your browser
+python -m agent_reach chat --no-cloud       # local runs only
+python -m agent_reach chat --model llama3.1:8b --port 8800
+```
+
+A local web page: the latest trends on the left, a chat with **Reach** on the right.
+
+- **Which report:** the newer of your latest local run (SQLite history) and the newest successful `cloud-runner` run on `main`. The cloud report is downloaded once with the GitHub CLI (`gh`) and cached under `reports/cloud/`. **Refresh** looks again.
+- **Grounded:** Reach answers only from the report (trends, scores, summaries, links, source health) and the headlines of earlier local runs. It says so when the report doesn't cover a question.
+- **Deep reads:** when a question names a trend (`#2`, `trend 3`, or words from its headline), Reach first reads that trend's source pages with the pipeline's page extractor, so it can go beyond the summary.
+- **Local only:** replies stream from your Ollama (`AGENT_REACH_CHAT_MODEL`, else `AGENT_REACH_OLLAMA_MODEL`). The server listens on 127.0.0.1 only and rejects other Host headers and non-JSON posts.
+
 ## Architecture
 
 | Module | Role |

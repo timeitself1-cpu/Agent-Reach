@@ -126,6 +126,20 @@ class Settings(BaseSettings):
     report_top_n: int = Field(default=15, ge=1, le=100)
     report_width: int = Field(default=100, ge=70, le=200)
 
+    # ----------------------------------------------------------------- chat
+    chat_model: str = ""  # Ollama model for `agent_reach chat`; "" = ollama_model
+    chat_port: int = Field(default=8765, ge=1024, le=65535)
+    chat_temperature: float = Field(default=0.3, ge=0.0, le=1.5)
+    chat_num_ctx: int = Field(default=8192, ge=2048, le=131072)
+    chat_history_turns: int = Field(default=8, ge=1, le=40)  # past user+assistant pairs sent to the model
+    chat_cloud_enabled: bool = True  # also look for a newer cloud-runner report (needs the GitHub CLI)
+    chat_cloud_repo: str = ""  # owner/repo; "" = the repo of the current git checkout
+    chat_cloud_branch: str = "main"
+    chat_cloud_workflow: str = "cloud-runner.yml"
+    chat_cache_dir: Path = Path("reports/cloud")  # downloaded cloud reports (gitignored)
+    chat_deep_read_urls: int = Field(default=2, ge=0, le=5)  # source pages read when a question names a trend
+    chat_deep_read_chars: int = Field(default=1500, ge=300, le=6000)
+
     @field_validator("velocity_window_weights")
     @classmethod
     def _weights_positive(cls, v: list[float]) -> list[float]:
